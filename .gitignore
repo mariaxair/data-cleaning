@@ -1,0 +1,16 @@
+# Secrets: never commit the real environment file, but keep the template.
+.env
+.env.*
+!.env.example
+
+# Local environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+
+# Data (source documents, outputs, cache database)
+data/
+*.log
