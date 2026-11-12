@@ -24,7 +24,7 @@ def test_legacy_ocr_api_key_is_fallback(monkeypatch) -> None:
 def test_provider_defaults_fill_base_url_and_model() -> None:
     heiyu = PipelineConfig(ocr_provider="heiyu")
     assert heiyu.ocr_base_url == "https://www.heiyucode.com/v1"
-    assert heiyu.ocr_model == "gpt-6-sol"
+    assert heiyu.ocr_model == "gpt-6.1-sol"
     assert heiyu.api_key_env == "HEIYU_API_KEY"
 
     openai = PipelineConfig(ocr_provider="openai")

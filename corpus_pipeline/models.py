@@ -36,6 +36,9 @@ class PageReport:
     warnings: list[str] = field(default_factory=list)
     ocr_failed: bool = False
     ocr_provider: str | None = None
+    ocr_latency_s: float | None = None
+    ocr_confidence: float | None = None
+    ocr_from_cache: bool = False
     cleaning_hits: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

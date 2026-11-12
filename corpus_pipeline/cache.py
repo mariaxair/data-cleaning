@@ -1,9 +1,13 @@
 """SQLite OCR cache and deterministic completion manifest."""
 
 import sqlite3
+import threading
 from pathlib import Path
 
 from .models import OCRResult
+
+# Serialise schema setup so parallel file workers cannot race on first use.
+_SCHEMA_LOCK = threading.Lock()
 
 
 class PipelineCache:
@@ -12,19 +16,27 @@ class PipelineCache:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS ocr_cache "
-                "(cache_key TEXT PRIMARY KEY, text TEXT NOT NULL, confidence REAL, provider TEXT NOT NULL)"
-            )
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS processed_files "
-                "(source_key TEXT PRIMARY KEY, source_hash TEXT NOT NULL, config_hash TEXT NOT NULL, "
-                "output_path TEXT NOT NULL, report_path TEXT NOT NULL, status TEXT NOT NULL)"
-            )
+        with _SCHEMA_LOCK:
+            with self._connect() as db:
+                # WAL lets readers and the single writer proceed concurrently.
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA synchronous=NORMAL")
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS ocr_cache "
+                    "(cache_key TEXT PRIMARY KEY, text TEXT NOT NULL, confidence REAL, provider TEXT NOT NULL)"
+                )
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS processed_files "
+                    "(source_key TEXT PRIMARY KEY, source_hash TEXT NOT NULL, config_hash TEXT NOT NULL, "
+                    "output_path TEXT NOT NULL, report_path TEXT NOT NULL, status TEXT NOT NULL)"
+                )
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+        # A generous timeout lets parallel writers wait instead of failing with
+        # "database is locked"; each call uses its own connection per thread.
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
 
     def get_ocr(self, cache_key: str) -> OCRResult | None:
         with self._connect() as db:

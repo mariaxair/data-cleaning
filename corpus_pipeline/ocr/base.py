@@ -50,7 +50,7 @@ class OCRAdapter(ABC):
 
     def _api_key(self) -> str:
         key = self.config.effective_api_key()
-        if not key or key == "YOUR_API_KEY_HERE":
+        if not key or (key.startswith("YOUR_") and key.endswith("_HERE")):
             raise RuntimeError(
                 f"OCR provider '{self.provider_name}' requires an API key; "
                 f"set {self.config.api_key_env} in .env or enter one in the GUI."
@@ -66,12 +66,17 @@ class OCRAdapter(ABC):
         return self.ocr_page(probe_image(), self.config.languages)
 
     @staticmethod
-    def _response_detail(response: requests.Response) -> str:
+    def _response_detail(response: requests.Response, secret: str = "") -> str:
         """Extract a short, secret-free provider error message."""
+        def sanitize(message: str) -> str:
+            if secret:
+                message = message.replace(secret, "***")
+            return redact_secrets(message)[:240]
+
         try:
             data = response.json()
         except ValueError:
-            return redact_secrets(response.text[:240])
+            return sanitize(response.text)
         if isinstance(data, dict):
             error = data.get("error")
             if isinstance(error, dict):
@@ -79,7 +84,7 @@ class OCRAdapter(ABC):
             else:
                 message = error or data.get("message") or ""
             if message:
-                return redact_secrets(str(message))[:240]
+                return sanitize(str(message))
         return ""
 
     def _post_json(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
@@ -123,7 +128,7 @@ class OCRAdapter(ABC):
                     time.sleep(max(0.0, delay))
                     continue
             if not response.ok:
-                detail = self._response_detail(response)
+                detail = self._response_detail(response, self.config.effective_api_key())
                 suffix = f": {detail}" if detail else ""
                 raise RuntimeError(
                     f"OCR provider '{self.provider_name}' returned HTTP {response.status_code}{suffix}; "
