@@ -4,6 +4,10 @@ import re
 from dataclasses import dataclass
 
 import ftfy
+from config import PipelineConfig
+from .rules import apply_rules
+from .rules.html import apply as clean_html
+from .rules.duplicates import apply as clean_duplicates
 
 
 @dataclass
@@ -16,14 +20,8 @@ _HEADER_LINE = re.compile(
     r"(?i)^\s*(?:ocr\s+)?(?:transcription|conversion|extraction)\s+"
     r"(?:result|notes?|output|of\s+the\s+document)\s*[:\-].*$"
 )
-_BR_TAG = re.compile(r"(?i)<\s*br\s*/?\s*>")
-_HTML_TAG = re.compile(r"<\s*/?\s*[a-zA-Z][^>]*>")
-_REPEATED_WORD = re.compile(
-    r"(?iu)(?<!\w)([\w\u0600-\u06ff]+)(?:\s+\1)+(?!\w)"
-)
-
-
-def clean_text(text: str, languages: list[str] | None = None) -> CleaningResult:
+def clean_text(text: str, languages: list[str] | None = None, *,
+               config: PipelineConfig | None = None) -> CleaningResult:
     """Repair mojibake and apply traceable, conservative format cleanups."""
     del languages  # Language hints are retained in the API for future rules.
     hits = {"encoding_repairs": 0, "metadata_headers": 0, "html_residue": 0,
@@ -44,9 +42,7 @@ def clean_text(text: str, languages: list[str] | None = None) -> CleaningResult:
             lines.pop(0)
     text = "\n".join(lines)
 
-    text, br_count = _BR_TAG.subn("\n", text)
-    text, tag_count = _HTML_TAG.subn("", text)
-    hits["html_residue"] = br_count + tag_count
+    text, hits["html_residue"] = clean_html(text)
 
     # Collapse only runs of three or more identical consecutive lines.
     collapsed: list[str] = []
@@ -65,5 +61,14 @@ def clean_text(text: str, languages: list[str] | None = None) -> CleaningResult:
         index = end
     text = "\n".join(collapsed)
 
-    text, hits["adjacent_word_duplicates"] = _REPEATED_WORD.subn(r"\1", text)
+    text, hits["adjacent_word_duplicates"] = clean_duplicates(text)
+    if config is not None and config.semantic_rules_enabled:
+        text, semantic_hits = apply_rules(text, config.rules_data_path, config.wrong_words_path)
+        hits.update(semantic_hits)
+        # Reviewed mappings must also be terminal across rule families and formatting.
+        candidate = text.strip()
+        repeated_format = clean_text(candidate, config=None).text
+        repeated_rules, _ = apply_rules(repeated_format, config.rules_data_path, config.wrong_words_path)
+        if repeated_rules.strip() != candidate:
+            raise ValueError("Semantic rules are not idempotent together; review the configured mappings.")
     return CleaningResult(text=text.strip(), hit_counts=hits)

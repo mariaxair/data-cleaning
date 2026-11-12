@@ -14,3 +14,5 @@ __pycache__/
 # Data (source documents, outputs, cache database)
 data/
 *.log
+
+Corpus_Processing_Pipeline.md

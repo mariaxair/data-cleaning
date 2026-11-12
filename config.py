@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+from corpus_pipeline.settings import TrainingSettings, env_bool
 
 
 # Load this project's .env without overriding variables already set by the shell.
@@ -32,7 +33,7 @@ PROVIDER_PROFILES: dict[str, ProviderProfile] = {
         label="HeiyuCode (OpenAI-compatible)",
         api_key_env="HEIYU_API_KEY",
         base_url="https://www.heiyucode.com/v1",
-        model="gpt-6-sol",
+        model="gpt-6.1-sol",
         notes="Gateway models: gpt-6.1-terra, gpt-6.1-sol, gpt-6-astra, gpt-6-sol, gpt-5.6-sol, gpt-5.6-terra.",
     ),
     "openai": ProviderProfile(
@@ -98,7 +99,7 @@ def provider_choices() -> list[tuple[str, str]]:
 
 # Paths and language hints
 INPUT_DIR = Path("data/in")
-OUTPUT_DIR = Path("data/out")
+OUTPUT_DIR = Path("data/ocr-out")
 SUPPORTED_LANGUAGES = ["ar", "fr", "en"]
 PAGE_MARKER_TEMPLATE = "\n\n--- Page {page} ---\n\n"
 INCLUDE_PAGE_MARKERS = True
@@ -121,13 +122,31 @@ OCR_MAX_RETRIES = 3
 OCR_RETRY_BASE_S = 1.0
 OCR_TEST_CONNECTION_ON_STARTUP = False
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive integer from the environment, falling back to a default."""
+    try:
+        return max(1, int(os.environ.get(name, "").strip() or default))
+    except ValueError:
+        return default
+
+
+# Bounded parallelism. Files and pages run concurrently, while simultaneous OCR
+# calls are capped globally so a batch cannot overwhelm the provider. Raise these
+# for more throughput, lower them if the provider rate-limits the account.
+# Any value set to 0 removes that cap: all files, all candidate pages, or all
+# provider calls start at once. Zero can exhaust memory or trigger rate limits.
+FILE_CONCURRENCY = _env_int("FILE_CONCURRENCY", 4)
+PAGE_CONCURRENCY = _env_int("PAGE_CONCURRENCY", 4)
+OCR_CONCURRENCY = _env_int("OCR_CONCURRENCY", 4)
+
 # Persistent cache and file completion manifest
 CACHE_DB = Path("data/pipeline.sqlite3")
 LOG_LEVEL = "INFO"
 
 
 @dataclass
-class PipelineConfig:
+class PipelineConfig(TrainingSettings):
     """Runtime settings, including session-only GUI overrides."""
 
     input_dir: Path = INPUT_DIR
@@ -140,16 +159,40 @@ class PipelineConfig:
     full_page_image_ratio: float = FULL_PAGE_IMAGE_RATIO
     render_dpi: int = PDF_RENDER_DPI
     ocr_provider: str = OCR_PROVIDER
-    ocr_api_key: str = OCR_API_KEY
+    ocr_api_key: str = field(default=OCR_API_KEY, repr=False)
     session_api_key_override: bool = False
     ocr_base_url: str = OCR_BASE_URL
     ocr_model: str = OCR_MODEL
     ocr_timeout_s: int = OCR_TIMEOUT_S
     ocr_max_retries: int = OCR_MAX_RETRIES
     ocr_retry_base_s: float = OCR_RETRY_BASE_S
+    file_concurrency: int = FILE_CONCURRENCY
+    page_concurrency: int = PAGE_CONCURRENCY
+    ocr_concurrency: int = OCR_CONCURRENCY
     cache_db: Path = CACHE_DB
 
+    # Per-document benchmarking is on by default because reference-free metrics
+    # are cheap. Reference-based accuracy activates only when a reference text
+    # is found; nothing is uploaded or sent to a provider.
+    benchmark_enabled: bool = field(default_factory=lambda: env_bool("BENCHMARK_ENABLED", default=True))
+    benchmark_dir: Path | None = field(default_factory=lambda: (
+        Path(os.environ["BENCHMARK_DIR"]) if os.environ.get("BENCHMARK_DIR") else None))
+    benchmark_reference_dir: Path = field(default_factory=lambda: Path(
+        os.getenv("BENCHMARK_REFERENCE_DIR", "data/reference")))
+    benchmark_max_eval_chars: int = field(default_factory=lambda: max(
+        1000, _env_int("BENCHMARK_MAX_EVAL_CHARS", 100_000)))
+    benchmark_strip_diacritics: bool = field(default_factory=lambda: env_bool(
+        "BENCHMARK_STRIP_DIACRITICS", default=True))
+    benchmark_unify_alef: bool = field(default_factory=lambda: env_bool(
+        "BENCHMARK_UNIFY_ALEF", default=False))
+    benchmark_unify_ya: bool = field(default_factory=lambda: env_bool(
+        "BENCHMARK_UNIFY_YA", default=False))
+
     def __post_init__(self) -> None:
+        # History and comparisons sit beside the output directory by default, so
+        # a test or a GUI session with a temporary output folder stays self-contained.
+        if self.benchmark_dir is None:
+            self.benchmark_dir = self.output_dir.parent / "benchmarks"
         # Fill base URL and model from the provider profile unless overridden.
         # Unknown provider ids are left untouched so custom adapters keep working.
         profile = PROVIDER_PROFILES.get((self.ocr_provider or "").strip().lower())

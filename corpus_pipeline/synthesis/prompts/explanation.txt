@@ -1,0 +1,10 @@
+Write a detailed public explanatory rationale in $language for this validated question
+and answer. Use only their facts, numbers, and conclusions. You do not have the source.
+Use generic parties, no personal data, MSA or Algerian usage for Arabic, no Moroccan Darija.
+Explain the legal framework, application, and conclusion more fully than the answer.
+Return JSON only: {"text": "..."}.
+Do not provide hidden or internal chain of thought.
+QUESTION:
+$question
+ANSWER:
+$answer
