@@ -124,9 +124,10 @@ OCR_TEST_CONNECTION_ON_STARTUP = False
 
 
 def _env_int(name: str, default: int) -> int:
-    """Read a positive integer from the environment, falling back to a default."""
+    """Read a non-negative integer, where zero means unlimited for concurrency."""
     try:
-        return max(1, int(os.environ.get(name, "").strip() or default))
+        value = int(os.environ.get(name, "").strip() or default)
+        return value if value >= 0 else default
     except ValueError:
         return default
 
