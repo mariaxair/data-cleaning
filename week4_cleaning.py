@@ -177,9 +177,18 @@ def read_source(path: Path) -> tuple[str, dict, list[str]]:
     raise ValueError(f"Unsupported extension: {suffix}")
 
 
-def source_files(root: Path) -> list[Path]:
+def source_files(root: Path, excluded_languages: set[str] | None = None,
+                 include_indexes: bool = False) -> list[Path]:
+    excluded_languages = excluded_languages or set()
     return [path for path in sorted(root.rglob("*"), key=lambda p: p.as_posix().casefold())
             if path.is_file() and path.suffix.casefold() in NON_PDF
+            and (include_indexes or path.name.casefold() != "index.csv")
+            and not any(
+                any((part.casefold() == language or
+                     language == "tamazight" and part.casefold().startswith("tamazight"))
+                    for part in path.parts)
+                for language in excluded_languages
+            )
             and not any(part in SKIP_PARTS for part in path.parts)]
 
 
@@ -190,13 +199,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, help="Process only the first N files for a pilot run")
     parser.add_argument("--sample-per-bucket", type=int, default=20)
     parser.add_argument("--semantic-rules", action="store_true")
+    parser.add_argument("--exclude-language", action="append", default=[],
+                        help="Exclude a language folder, repeatable (for example: tamazight)")
+    parser.add_argument("--include-index-files", action="store_true",
+                        help="Process index.csv metadata as text; excluded by default")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     root = args.source_root.expanduser().resolve()
-    paths = source_files(root)
+    paths = source_files(root, {item.casefold() for item in args.exclude_language},
+                         include_indexes=args.include_index_files)
     if args.limit is not None:
         paths = paths[:max(0, args.limit)]
     output = args.output.expanduser().resolve()
@@ -238,10 +252,17 @@ def main() -> int:
                            "normalized_sha256": exact_hash, "simhash": f"{fingerprint:016x}"})
             exact[exact_hash].append(record["relative_path"])
             simhashes.append((fingerprint, record["relative_path"]))
-            destination = cleaned_root / Path(record["relative_path"]).with_suffix(".txt")
+            relative = Path(record["relative_path"])
+            # Preserve the source directory while shortening the filename so
+            # deeply nested Windows paths cannot turn a successful read into a
+            # misleading output-write failure.
+            short_name = f"{relative.stem[:48]}-{digest(record['relative_path'])[:10]}.txt"
+            destination = cleaned_root / relative.parent / short_name
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(cleaned, encoding="utf-8")
+            record["cleaned_path"] = str(destination)
         except Exception as exc:
+            record["status"] = "failed"
             record["rejection_reasons"] = ["read_or_parse_error"]
             record["error"] = str(exc)[:300]
         records.append(record)
