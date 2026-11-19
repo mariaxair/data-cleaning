@@ -20,6 +20,11 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true", help="Enable Stage 2.2 semantic corrections")
     parser.add_argument("--rules-report", type=Path, help="Write aggregated cleaning hit counters")
     parser.add_argument("--synthesize", action="store_true", help="Stage 3: synthesize QA from cleaned TXT/MD")
+    parser.add_argument("--slice-md", action="store_true",
+                        help="Slice whole gazette OCR Markdown issues into one JSONL row per legal instrument")
+    parser.add_argument("--slice-output", type=Path, help="Folder for slice JSONL (default: stage-output/slices)")
+    parser.add_argument("--slice-preamble", action="store_true",
+                        help="Keep each instrument's preamble instead of starting at its first article")
     parser.add_argument("--metadata", action="store_true", help="Discover evidence-backed metadata from cleaned TXT/MD")
     parser.add_argument("--metadata-llm", action="store_true", help="Enable configured metadata model calls")
     parser.add_argument("--metadata-model", help="Explicit text model for metadata extraction")
@@ -101,6 +106,7 @@ def main() -> int:
             f"groups={len(comparison['groups'])}")
         return 0
     requested = [name for name, enabled in (
+        ("slice", args.slice_md),
         ("synthesize", args.synthesize or args.discover_topics),
         ("metadata", args.metadata),
         ("process-corpus", args.process_corpus), ("review", args.review)) if enabled]
@@ -126,7 +132,7 @@ def main() -> int:
     folder = args.folder or (INPUT_DIR if not paths else None)
     if folder:
         extensions = {".jsonl"} if stage in {"process-corpus", "review"} else (
-            {".txt", ".md"} if stage in {"synthesize", "metadata"} else {".pdf", ".txt", ".md", ".docx"})
+            {".txt", ".md"} if stage in {"synthesize", "metadata", "slice"} else {".pdf", ".txt", ".md", ".docx"})
         paths.extend(sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in extensions))
     if args.test_connection:
         result = create_adapter(config).test_connection()
@@ -135,6 +141,13 @@ def main() -> int:
             return 0
     if not paths:
         parser.error("Pass at least one file or use --folder.")
+    if stage == "slice":
+        from corpus_pipeline.slicing import slice_folder
+        output = args.slice_output or (config.stage_output_dir / "slices")
+        result = slice_folder(paths, output, include_preamble=args.slice_preamble)
+        logger.info("slicing " + json.dumps({key: result[key] for key in
+                                             ("files", "instruments", "eligible", "warnings")}))
+        return 0
     if stage == "metadata":
         from corpus_pipeline.metadata.runner import discover_metadata
         try:

@@ -392,6 +392,52 @@ training fields from [settings.py](../corpus_pipeline/settings.py).
 * No trained/validated dialect classifier was provided. The default lexicon is explicitly degraded,
   not a replacement for a validated model. Default review therefore does not auto-accept Arabic QA.
 
+## Gazette slicing (whole OCR issue to instrument records)
+
+`cli.py --slice-md` turns one whole Official Journal OCR issue (`OCR/A2026006.md`) into one JSONL row
+per legal instrument. The hand-picked `切片/` samples remain reference fixtures; the slicer extracts
+every instrument in the issue instead of one law.
+
+    .\.venv\Scripts\python.exe cli.py --slice-md --folder OCR --slice-output data/slices
+    .\.venv\Scripts\python.exe cli.py --slice-md --slice-preamble --folder OCR --slice-output data/slices
+
+Behaviour:
+
+* The index (`فهرس`, including `فهرس (تابع)`) and the masthead are dropped. The body starts at the
+  first instrument that is followed by its articles, not at the first heading-looking line.
+* Instruments are recognised from `مرسوم/قرار/مقرر/أمر/قانون/اتفاقية/...` plus a number (`رقم 26-66`)
+  or a date (`مؤرخ في`). Dual notices (`مرسومان تنفيذيان`) stay one record with a
+  `plural_instrument` warning because the journal prints one shared notice.
+* Cross-references (`وبمقتضى`, `بموجب`, `بناء على`) are not boundaries. A heading the OCR glued to the
+  previous paragraph is split off; the repair is listed in the per-file `repairs` summary.
+* Default text is the title plus the instrument's own articles and signature. `--slice-preamble` keeps
+  the preamble and enacting formula instead.
+* Page furniture (`الصفحة 7`, `الجريدة الرسمية ... العدد 10`, bare page numbers, date headers, rules)
+  is removed wherever it appears, not only at the end of a record.
+* A ratified agreement printed after the signature (heading `اتفاق ...` / `اتفاقية ...`) becomes its
+  own `agreement` record with `parent` set to the ratifying instrument.
+* Article headings are normalised (`الأولى` to 1, `مكرر` kept). In an amending instrument, quoted
+  articles (`"المادة 16`, `**"المادة 16`) go to `quoted_articles` and do not break the instrument's
+  own sequence.
+
+Record fields: the six reference keys first (`text, law_number, law_type, year, lang, source`), then
+audit fields (`index, category, eligible, title, parent, article_numbers, quoted_articles, page,
+line_start, line_end, char_start, char_end, warnings, slice_id, article_count`). `year` is a string
+such as `"2026"`; offsets refer to the normalised body (CRLF removed, glued headings split).
+
+Warnings: `missing_articles:5-12`, `duplicate_articles:1`, `article_order`, `page_order_suspected`,
+`number_reversed_in_ocr`, `number_not_in_index`, `unnumbered`, `plural_instrument`,
+`multiple_decrees`, `amending_instrument`, `annex`, `no_articles`. `eligible` is true only for a
+non-individual instrument with articles and without missing/duplicate/order warnings, so a truncated
+OCR law (for example 26-80, whose articles 1-2 never reached the OCR) keeps its text and warnings but
+is not offered to synthesis. `summary.json` also reconciles index numbers against body numbers
+(`index_missing`, `index_extra`).
+
+Limits: pages are never reordered and no text is invented. Interleaved scan pages stay in the record
+and are flagged, or are dropped when they precede the preamble; duplicated pages are flagged rather
+than merged. A treaty annex whose first pages were printed before the decree reports
+`missing_articles` on the annex instead of borrowing the decree's copy.
+
 ## 1. End-to-end workflow and contracts
 
 The default command still performs extraction plus format cleaning. All remaining stages require a
@@ -838,6 +884,7 @@ Paths below are relative to repository root.
 | corpus_pipeline/logging_utils.py | JSONFormatter and configure_logging |
 | corpus_pipeline/artifacts.py | fingerprint, atomic_text, read_jsonl, write_json/write_jsonl |
 | corpus_pipeline/benchmark.py | Per-document quality/OCR/cleaning/reference metrics, history, comparison |
+| corpus_pipeline/slicing.py | Whole-issue OCR Markdown to per-instrument records, metadata, index reconciliation |
 | corpus_pipeline/ocr/base.py | OCRAdapter protocol, probe_image, shared retries and safe error redaction |
 | corpus_pipeline/ocr/openai_compatible.py | Endpoint construction, vision payload/response parsing |
 | corpus_pipeline/ocr/openai.py | OpenAI adapter defaults |
@@ -884,6 +931,7 @@ Paths below are relative to repository root.
 | tests/test_config.py, test_providers.py, test_registry.py | Original provider/default/key/probe tests retained |
 | tests/test_parallel.py, test_mixed_pdf.py, test_routing_cleaning.py | Original ordering, WAL, ligature, mixed-PDF, cleaner tests retained |
 | tests/test_benchmark.py | Normalisation, CER/WER, quality proxies, references, per-document and history artifacts |
+| tests/test_slicing.py | Index/body bounds, glued headings, article gaps, reversed numbers, quoted amendments, annexes |
 
 ## 4. Configuration reference
 
@@ -1176,6 +1224,7 @@ pages.
 | Format cleaning and legacy byte output | Implemented, regression-tested | Domain sampling |
 | Article-digit correction, explicit glyph/date/footer/word engines | Implemented; mappings degraded/empty by design | Reviewed domain mappings and Roman-numeral scope |
 | Screening and 2–4 article segmentation | Implemented, conservative | Validated tier/exclusion lexicon or manual overrides |
+| Whole-issue gazette slicing into per-instrument records | Implemented; unit-tested on the three reference issues | Wider OCR issue sample; interleaved scan pages stay flagged for manual repair |
 | Semantic relatedness of article groups / scrambled-Arabic detection | Specification-only beyond structural checks | Domain model/manual adjudication |
 | Three-step synthesis, bounded retries, cost cap, phase checkpoints | Implemented with fake-adapter coverage | Explicit compatible text model/key; no live quality claim |
 | Exact evidence/numeric/article/script/known-PII checks | Implemented, partial assurance | Semantic entailment, fact-coverage, and unknown-name review |
@@ -1197,7 +1246,7 @@ Baseline: 20 existing tests passed before changes. Phase A: 37 passed. Phase B: 
 Phase C: 57 passed. Phase D: 65 passed. Final integration/edge suite: 76 passed, including all 20
 original tests. Benchmark additions: 87 passed, including the 11 new benchmark tests. GUI stage
 regression tests bring the suite to 96 passed, including unlimited-concurrency coverage. The command
-above reproduces the suite.
+above reproduces the suite. Gazette slicing adds 9 tests; the current suite is 122 passed.
 The only observed dependency warning is PyMuPDF's deprecated ByteString use on Python 3.15.
 
 Existing files changed minimally: config.py exposes inherited settings and hides keys in repr;

@@ -121,6 +121,9 @@ The GUI listens on the local Gradio address printed at startup. Selecting a prov
 | **4 · Review** | Score governed records; deterministic by default, or model review/repair when enabled. |
 | **5 · Benchmarks** | Refresh provider/model comparisons from benchmark history, show CER/WER and reference coverage. |
 
+Slicing whole gazette issues is available from the CLI (`--slice-md`), see
+[the slicing notes](docs/PIPELINE.md#gazette-slicing-whole-ocr-issue-to-instrument-records).
+
 The extraction tab keeps multiple uploads or a folder path, per-file and per-page reports, side-by-side previews, and TXT downloads. A shared collapsible **Text generation settings** section above the tabs supplies the provider, key, base URL, and text model used by Synthesis and LLM Review. It is separate from the OCR vision model, and live synthesis or LLM review refuses to start without `SYNTHESIS_MODEL`. Explicit uploads take precedence over prefilled folder or path fields.
 
 ## OCR providers
@@ -188,6 +191,7 @@ Semantic rules repair article-digit confusions and apply explicit reviewed glyph
 Run from the repository root, using the venv. Every optional stage is disabled in config by default; a CLI flag selects it for that invocation, and the equivalent GUI tab runs it interactively. Multiple stage selectors in one CLI invocation are rejected. In the GUI, stages run one at a time from their own tabs.
 
     .\.venv\Scripts\python.exe cli.py --clean --rules-report data/rules-hits.json data/in/law.pdf
+    .\.venv\Scripts\python.exe cli.py --slice-md --folder OCR --slice-output data/slices
     .\.venv\Scripts\python.exe cli.py --synthesize --dry-run --max-samples 10 --manual-overrides data/overrides.json data/out/law-HASH.txt
     .\.venv\Scripts\python.exe cli.py --synthesize --max-samples 10 --manual-overrides data/overrides.json data/out/law-HASH.txt
     .\.venv\Scripts\python.exe cli.py --process-corpus data/training/synthesis/qa.jsonl

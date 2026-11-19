@@ -193,7 +193,7 @@ def source_files(root: Path, excluded_languages: set[str] | None = None,
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Week 4 non-PDF cleaning and audit")
+    parser = argparse.ArgumentParser(description="Week 4 non-PDF cleaning and   audit")
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("data/week4"))
     parser.add_argument("--limit", type=int, help="Process only the first N files for a pilot run")
