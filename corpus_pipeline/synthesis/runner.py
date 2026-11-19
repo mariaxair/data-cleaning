@@ -86,6 +86,9 @@ def generate_unit(unit: SynthesisUnit, config: PipelineConfig, adapter: Generati
     if unit.synthesis_mode == "automatic":
         metadata.update(topic=unit.topic, topic_group_id=unit.topic_group_id,
                         char_start=unit.char_start, char_end=unit.char_end)
+    if config.synthesis_metadata_enabled:
+        from ..metadata.runner import metadata_provenance
+        metadata["discovered_metadata"] = metadata_provenance(unit.source_sha256, config)
     return {
         "id": identity, "status": "pending_review", "question": responses["question"]["text"],
         "answer": responses["answer"]["text"], "reasoning_chain": responses["explanation"]["text"],

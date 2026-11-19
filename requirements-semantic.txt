@@ -1,0 +1,4 @@
+# Optional metadata semantic chunking only. No runtime auto-installation.
+# v1.5.2 public API checked; actual embeddings still require corpus evaluation.
+-r requirements.txt
+chonkie[semantic]==1.5.2

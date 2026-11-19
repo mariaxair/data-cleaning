@@ -20,6 +20,12 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true", help="Enable Stage 2.2 semantic corrections")
     parser.add_argument("--rules-report", type=Path, help="Write aggregated cleaning hit counters")
     parser.add_argument("--synthesize", action="store_true", help="Stage 3: synthesize QA from cleaned TXT/MD")
+    parser.add_argument("--metadata", action="store_true", help="Discover evidence-backed metadata from cleaned TXT/MD")
+    parser.add_argument("--metadata-llm", action="store_true", help="Enable configured metadata model calls")
+    parser.add_argument("--metadata-model", help="Explicit text model for metadata extraction")
+    parser.add_argument("--metadata-max-calls", type=int, help="Metadata model-call budget")
+    parser.add_argument("--with-metadata", action="store_true", help="Attach existing metadata references to QA provenance")
+    parser.add_argument("--metadata-evaluate", type=Path, help="Evaluate metadata against annotated reference JSONL")
     parser.add_argument("--screening-mode", choices=["legal", "automatic"],
                         help="Legacy legal screening or model-discovered themes in any domain")
     parser.add_argument("--discover-topics", action="store_true",
@@ -28,7 +34,7 @@ def main() -> int:
     parser.add_argument("--process-corpus", action="store_true", help="Stage 4: govern QA JSONL")
     parser.add_argument("--review", action="store_true", help="Stage 5: review QA JSONL offline by default")
     parser.add_argument("--llm-review", action="store_true", help="Enable configured model review/repair")
-    parser.add_argument("--dry-run", action="store_true", help="Plan synthesis without model calls")
+    parser.add_argument("--dry-run", action="store_true", help="Plan synthesis/metadata without model calls or embeddings")
     parser.add_argument("--max-samples", type=int, help="Maximum synthesis units scheduled")
     parser.add_argument("--stage-output", type=Path, help="Optional stages' output root")
     parser.add_argument("--manual-overrides", type=Path, help="Document tier/metadata overrides JSON")
@@ -42,6 +48,14 @@ def main() -> int:
     args = parser.parse_args()
     logger = configure_logging(LOG_LEVEL)
     config = PipelineConfig()
+    if args.metadata_llm:
+        config.metadata_llm_enabled = True
+    if args.metadata_model is not None:
+        config.metadata_model = args.metadata_model
+    if args.metadata_max_calls is not None:
+        config.metadata_max_calls = args.metadata_max_calls
+    if args.with_metadata:
+        config.synthesis_metadata_enabled = True
     if args.screening_mode:
         config.synthesis_screening_mode = args.screening_mode
     if args.discover_topics:
@@ -62,6 +76,18 @@ def main() -> int:
         config.benchmark_dir = args.benchmark_dir
     if args.reference_dir:
         config.benchmark_reference_dir = args.reference_dir
+    if args.metadata_evaluate:
+        from corpus_pipeline.benchmark import evaluate_metadata
+        try:
+            result = evaluate_metadata(config.stage_output_dir / "metadata" / "documents.jsonl",
+                                       args.metadata_evaluate, config.stage_output_dir / "metadata" / "evaluation.json",
+                                       min_precision=config.metadata_eval_min_precision,
+                                       min_recall=config.metadata_eval_min_recall,
+                                       min_examples=config.metadata_eval_min_examples)
+        except (ValueError, OSError, KeyError, TypeError):
+            parser.error("Metadata evaluation requires valid documents and annotated reference JSONL.")
+        logger.info("metadata evaluation " + json.dumps(result))
+        return 0
     if args.compare_benchmarks:
         from corpus_pipeline.artifacts import write_json
         from corpus_pipeline.benchmark import load_comparison, write_comparison
@@ -76,23 +102,31 @@ def main() -> int:
         return 0
     requested = [name for name, enabled in (
         ("synthesize", args.synthesize or args.discover_topics),
+        ("metadata", args.metadata),
         ("process-corpus", args.process_corpus), ("review", args.review)) if enabled]
     if not requested:
         requested = [name for name, enabled in (
             ("synthesize", config.synthesis_enabled), ("process-corpus", config.corpus_processing_enabled),
+            ("metadata", config.metadata_enabled),
             ("review", config.review_enabled)) if enabled]
     if len(requested) > 1:
         parser.error("Select one optional stage per invocation.")
     stage = requested[0] if requested else "extract"
-    if args.dry_run and stage != "synthesize":
-        parser.error("--dry-run requires --synthesize.")
+    if args.dry_run and stage not in {"synthesize", "metadata"}:
+        parser.error("--dry-run requires --synthesize or --metadata.")
+    if (args.metadata_llm or args.metadata_model or args.metadata_max_calls is not None) and stage != "metadata":
+        parser.error("Metadata model settings require --metadata.")
+    if args.with_metadata and stage != "synthesize":
+        parser.error("--with-metadata requires --synthesize.")
+    if args.test_connection and stage == "metadata":
+        parser.error("Metadata does not use the OCR connection test; use --metadata --dry-run to inspect its plan.")
     if args.llm_review and stage != "review":
         parser.error("--llm-review requires --review.")
     paths = [Path(path) for path in args.paths]
     folder = args.folder or (INPUT_DIR if not paths else None)
     if folder:
         extensions = {".jsonl"} if stage in {"process-corpus", "review"} else (
-            {".txt", ".md"} if stage == "synthesize" else {".pdf", ".txt", ".md", ".docx"})
+            {".txt", ".md"} if stage in {"synthesize", "metadata"} else {".pdf", ".txt", ".md", ".docx"})
         paths.extend(sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in extensions))
     if args.test_connection:
         result = create_adapter(config).test_connection()
@@ -101,6 +135,15 @@ def main() -> int:
             return 0
     if not paths:
         parser.error("Pass at least one file or use --folder.")
+    if stage == "metadata":
+        from corpus_pipeline.metadata.runner import discover_metadata
+        try:
+            result = discover_metadata(paths, config, dry_run=args.dry_run)
+        except (ValueError, RuntimeError, OSError):
+            parser.error("Metadata could not start; check METADATA_MODEL, provider credentials, configuration, and output permissions.")
+        logger.info(f"metadata processed={result.get('processed', len(result.get('documents', [])))} "
+                    f"model_calls={result.get('model_calls', 0)} dry_run={args.dry_run}")
+        return 1 if result.get("failed") else 0
     if stage == "review":
         from corpus_pipeline.artifacts import read_jsonl
         from corpus_pipeline.review.runner import review_corpus

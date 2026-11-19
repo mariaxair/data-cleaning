@@ -1,5 +1,238 @@
 # Corpus pipeline engineering guide
 
+## Metadata discovery (shadow stage)
+
+This opt-in stage implements [the metadata plan](METADATA_DISCOVERY_PLAN.md). It consumes
+cleaned TXT/MD and an optional adjacent `.report.json`. It does not modify legacy OCR, QA,
+governance, review, or benchmark outputs. All metadata flags default off. The dedicated GUI
+tab shares the existing provider/key controls and has a separate explicit metadata model.
+
+```mermaid
+flowchart TD
+    In["TXT/MD + source report"] --> Envelope["Hash, language, page map"]
+    Envelope --> Legal{"Supported instrument + article structure?"}
+    Legal -->|yes| Regex["Regex metadata + legal structural spans"]
+    Legal -->|uncertain| Fallback["needs_fallback; preserve available legal spans"]
+    Legal -->|other| Semantic["Optional Chonkie proposals"]
+    Semantic --> Checked{"Exact offsets, contiguous, bounded?"}
+    Checked -->|no or unavailable| Paragraph["Paragraph/recursive spans; degraded"]
+    Checked -->|yes| Windows["Source-preserving request windows"]
+    Paragraph --> Windows
+    Fallback --> Windows
+    Windows --> Live{"Explicit model enabled + budget?"}
+    Live -->|no| Pending["Pending + review queue"]
+    Live -->|yes| Model["Cached generic observation-list extraction"]
+    Model --> Evidence["Validate value, quotes, offsets, pages, dates"]
+    Regex --> Evidence
+    Evidence --> Registry["Match / candidate / uncertain"]
+    Registry --> Out["Document + chunks + registry + audit"]
+    Registry --> Queue["Optional adjudication + migration journal"]
+```
+
+ASCII: `TXT -> envelope -> legal regex OR semantic/fallback windows -> evidence -> registry -> JSONL`.
+
+### Identity, evidence, and source preservation
+
+`source_sha256` hashes raw input bytes and is the content-based `document_id`. Identical renamed
+files share field recurrence counts; the latest path is shown, so this is not a filesystem-copy
+inventory. `source` is the cleaned path; `processing` retains the original PDF path/hash from its
+report. Offsets are Unicode character indices into UTF-8-sig decoded text, preserving CRLF, rather
+than byte offsets/PDF coordinates. BOM is excluded from decoded text, not from the byte hash.
+Unreadable sources receive failed technical envelopes with an empty unavailable hash and a reason.
+
+The generic model returns a fixed `observations` array with open-ended labels and typed values,
+not a different JSON schema per document. Prompts treat source/context as untrusted data. Every
+verified observation needs exact evidence in the supplied window and correct offsets/page mapping.
+String/numeric/date values must occur verbatim in their evidence. Unsupported values stay in the
+audit. `absent` values remain missing; inferred/ambiguous values remain uncertain. Model confidence
+is uncalibrated. Exact quotes support domain/language classifications but cannot prove their semantic
+correctness. No verified metadata values are injected into training text.
+
+Language reuses the script detector: Arabic can be detected; Latin script alone remains unknown
+rather than being guessed French. Evidence-backed model language observations may supplement it;
+conflicting values remain unknown. Domains are multi-label, retaining original labels and normalized
+IDs. Only case/punctuation/Unicode-equivalent labels coalesce; different domain meanings are never
+silently merged. Existing automatic topic grouping remains a separate facility.
+
+Dates remain a list with original text, supported role, and optional ISO normalization. Only valid,
+unambiguous supported Gregorian formats become ISO. `03/04/2026` remains unnormalized. Hijri
+conversion is unsupported. Date roles require explicit local supporting words. Damaged/partial
+extraction defers model calls and remains visible for review.
+
+### Legal structure and semantic fallback
+
+The legal extractor is separate from synthesis. It accepts supported instrument identifiers,
+Markdown levels, bold article wrappers, Western/Arabic-Indic digits, and the first five Arabic
+ordinal forms. It records titles/types/numbers, explicit authority/jurisdiction phrases, dates,
+article/chapter headings, membership, offsets, and pages without rewriting source digits/text.
+Multiple instruments retain local membership. Gazette titles/index mentions may repeat; a verified
+mention is not a claim that one instrument is the exclusive subject. Unknown ordinal/layout variants
+or missing instrument/article identifiers produce `needs_fallback`, preserved even when generic
+fallback later succeeds. Context chunks retain preambles/page markers, enabling exact reconstruction.
+Legal article/chapter boundaries always take priority over similarity.
+
+Optional install: `.\.venv\Scripts\python.exe -m pip install -r requirements-semantic.txt`.
+Chonkie **1.5.2** is pinned; its tagged constructor/source was checked. Integration tests use fake
+chunkers. **Real embeddings/runtime and Arabic/French boundary quality remain unvalidated here.**
+No heavy packages or model weights were installed for this change. Enable semantic chunking
+separately and supply an embedding identifier/local model explicitly. A non-dry enabled run may
+initialize/download that chosen model; use prepared local weights for offline operation.
+
+The adapter requires skip-window 0, exact original slices, contiguous ordered reconstruction,
+token/character size caps, and retained delimiters (including `؟`/`؛`). Unsupported versions,
+missing extras, initialization failures, invalid offsets, dropped content, or oversized proposals
+select the deterministic paragraph/recursive fallback and record a fixed warning. Dry run never
+imports Chonkie or initializes embeddings; fallback boundaries in its plan are provisional.
+
+Fallback token counts are unknown: UTF-8 byte counts provide a conservative estimate for ordinary
+byte-based tokenizers, not a measured provider token count. Exact `token_count` stays null for
+fallback/legal chunks. Legal structural chunks may exceed generic caps; generic fallback requests
+subdivide them without replacing their authoritative structure. Document metadata is reconciled
+once and inherited by reference. Chunk-local observations use the same evidence contract.
+
+### Field registry and execution
+
+Labels normalize NFKC/case/whitespace/punctuation only for comparison. Matching requires compatible
+type/scope. Exact labels/recorded aliases match; fuzzy labels additionally need matching descriptions.
+Different-script synonyms can match a sufficiently descriptive exact definition plus evidence-backed
+example value shapes. Otherwise new labels remain candidates. Homonyms, conflicting types/scopes,
+or multiple plausible matches remain uncertain. No spelling similarity is presented as a calibrated
+semantic model. Raw observations stay available for optional adjudication.
+
+Promotion requires configurable distinct-document recurrence and minimum confidence, with recorded
+counts/reasons. `stable` means recurrent/consistent, **not production quality approval**. Fields start
+with `quality_approved=false`. `FieldRegistry.migrate(action, field_id, reason=...)` provides explicit
+merge/split/rename/type_change/deprecation/uncertainty/quality_approval operations, retaining aliases
+and before/after snapshots. History is append-only and replayable if a snapshot is lost. Historical
+document exports are not rewritten by migrations. Use one metadata writer per output directory.
+
+| Artifact under `STAGE_OUTPUT_DIR/metadata/` | Responsibility |
+|---|---|
+| `plan.json`, `dry-run-summary.json` | Routes, chunker/fallback reasons, request estimates; dry run changes no registry/data exports |
+| `documents.jsonl` | Envelopes, canonical metadata/dates/domains, exact chunks and inherited references |
+| `observations.jsonl` | Raw/canonical, rejected/uncertain/missing observations with request/response fingerprints |
+| `field-registry.json` | Versioned fields, aliases, evidence examples, counts, status |
+| `registry-history.jsonl` | Append-only migration/alias/promotion/occurrence events |
+| `review-queue.jsonl` | Unresolved/invalid/pending cases and failed inputs |
+| `cache/<hash>.json` | Validated window response keyed by prompt/provider/endpoint/model/version/parameters |
+| `summary.json` | Run routes/statuses/chunkers, corpus fields/confidence bands, failures/timing/calls |
+| `evaluation.json` | Reference metrics and per-field eligibility; registry is not automatically modified |
+
+ASCII artifact map: `TXT -> documents/chunks + observations -> registry/history + queue`;
+`request identity -> cache`; `documents + annotations -> evaluation`.
+
+Incremental runs preserve unrelated documents/audits and replace the current content ID's rows.
+Cache entries are revalidated; corrupt/missing entries regenerate only with model enablement.
+Rejected evidence is not cached as a successful extraction. Reruns do not inflate recurrence.
+Budget exhaustion/provider exceptions leave pending windows; rerun to resume. Model-call budgets
+include extraction attempts; underlying HTTP retries still use the existing backoff and can make
+up to `OCR_MAX_RETRIES+1` HTTP attempts per model attempt. Unknown price/usage means cost stays null.
+Recorded prompt/model/version/parameters/response fingerprints contain no keys. Unsafe responses
+are withheld/sanitized; exception bodies are not serialized. A source containing a configured
+credential is withheld. No live preflight request is sent. Model/key/provider configuration is
+checked locally before registry mutation when live generic extraction is needed.
+
+Unreadable reports fail visibly rather than losing provenance. Corrupt registry/history fails
+clearly: restore the snapshot/journal rather than deleting history to force a silent merge.
+Failed OCR pages are fixed through extraction first. Unknown classifications, pending calls, and
+rejected evidence remain reviewable instead of entering training.
+
+### Module map
+
+| File | Responsibility / entry points |
+|---|---|
+| `models.py` | Typed metadata/evidence/field contracts, versioned optional-field deserialization |
+| `metadata/legal.py` | `legal_extract`, dates, source evidence and page mapping |
+| `metadata/chunking.py` | `chunk_document`, lazy optional Chonkie adapter, `recursive_spans` fallback |
+| `metadata/extraction.py`, `metadata/prompt.txt` | Generic prompt and `validate_observations` |
+| `metadata/registry.py` | `FieldRegistry`, conservative matching, promotion, replay and `migrate` |
+| `metadata/runner.py` | `discover_metadata`, budget/cache, reconciliation/artifacts, provenance references |
+| `settings.py` | Metadata env/dataclass settings and validation |
+| `synthesis/client.py`, `artifacts.py` | Existing client/atomic writers reused without modification |
+| `synthesis/runner.py` | Optional additive metadata references only |
+| `benchmark.py` | `evaluate_metadata`, alongside existing OCR evaluation |
+| `cli.py`, `app.py` | Opt-in CLI and metadata GUI tables/downloads |
+
+### Configuration reference
+
+All new knobs are environment variables in `TrainingSettings` through `PipelineConfig`. Existing
+provider/key/base URL/timeout/retry conventions apply. GUI overrides stay in memory.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `METADATA_ENABLED` | false | Select metadata when no explicit stage flag is supplied |
+| `METADATA_LLM_ENABLED` | false | Permit generic metadata provider calls |
+| `METADATA_MODEL` | empty | Explicit metadata model, independent of OCR/synthesis |
+| `METADATA_MAX_CALLS` | 100 | Global model-attempt cap per run |
+| `METADATA_MAX_ATTEMPTS` | 2 | Attempts/window within global cap |
+| `METADATA_MAX_TOKENS` | 4096 | Response token cap |
+| `METADATA_CHUNK_CHARS` | 6000 | Generic chunk/request character cap |
+| `METADATA_SEMANTIC_ENABLED` | false | Lazy optional semantic chunker |
+| `METADATA_EMBEDDING_MODEL` | empty | Explicit embedding identifier/local model |
+| `METADATA_SEMANTIC_THRESHOLD` | 0.8 | Uncalibrated Chonkie threshold |
+| `METADATA_CHUNK_TOKENS` | 2048 | Semantic token cap / fallback byte-estimate budget |
+| `METADATA_SIMILARITY_WINDOW` | 3 | Neighbouring-sentence window |
+| `METADATA_SKIP_WINDOW` | 0 | Only 0 accepted: no noncontiguous merges |
+| `METADATA_DELIMITERS` | `[". ","! ","? ","؟","؛","\n"]` | JSON delimiter array |
+| `METADATA_INCLUDE_DELIM` | prev | Retain delimiters on prev/next side |
+| `METADATA_MATCH_THRESHOLD` | 0.95 | Label/description match threshold |
+| `METADATA_MATCH_MARGIN` | 0.1 | Required lead over another plausible field |
+| `METADATA_PROMOTION_DOCUMENTS` | 5 | Distinct-document recurrence requirement |
+| `METADATA_MIN_CONFIDENCE` | 0.9 | Observation confidence signal threshold |
+| `METADATA_EVAL_MIN_PRECISION` | 0.98 | Held-out field eligibility precision |
+| `METADATA_EVAL_MIN_RECALL` | 0.9 | Held-out field eligibility recall |
+| `METADATA_EVAL_MIN_EXAMPLES` | 20 | Annotated examples required for eligibility |
+| `SYNTHESIS_METADATA_ENABLED` | false | Add version/status/reference to QA provenance only |
+| `STAGE_OUTPUT_DIR` | data/training | Existing root; metadata uses a separate subdirectory |
+
+### Commands and evaluation
+
+```powershell
+.\.venv\Scripts\python.exe cli.py --metadata --dry-run --folder data/ocr-out
+.\.venv\Scripts\python.exe cli.py --metadata --folder data/ocr-out
+# Set METADATA_MODEL and the selected provider key in .env before live generic extraction:
+.\.venv\Scripts\python.exe cli.py --metadata --metadata-llm --metadata-max-calls 100 --folder data/ocr-out
+.\.venv\Scripts\python.exe cli.py --metadata-evaluate data/metadata-reference.jsonl
+.\.venv\Scripts\python.exe cli.py --synthesize --screening-mode automatic --with-metadata --folder data/ocr-out
+.\.venv\Scripts\python.exe app.py
+.\.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider
+```
+
+Worked example: `مرسوم رئاسي رقم ٢٦-٩٠` plus `## المادة الأولى` takes the legal route with zero
+model calls, stores original `٢٦-٩٠` and normalized `26-90` separately, and retains exact page/article
+spans. A research file mentioning `Example University` remains pending offline; a live enabled model
+may propose a previously unseen `university` field grounded in that quote. Five distinct documents
+can make it stable; rerunning the same content cannot.
+
+Evaluation consumes operator-annotated JSONL (one document per line), for example:
+
+```json
+{"source":"data/ocr-out/research.txt","source_text":"Example University","observations":[{"label":"university","value":"Example University","scope":"document"}],"chunk_boundaries":[]}
+```
+
+Prefer `document_id`/`source_sha256` to paths. `source_text` must retain exact decoded content.
+`chunk_boundaries` lists internal chunk end offsets, excluding final document end. Add
+`expected_field_id` to observations for registry-match error measurement. Label/value/scope define
+exact match. Metrics include precision/recall, exact-document match, evidence support, abstention,
+annotated mapping errors, boundary precision/recall, reconstruction, and recorded latency. Unannotated
+metrics stay unavailable; source-less evidence checks report reconstruction-only coverage. Pricing is
+not invented. Quality eligibility requires configured sample/precision/recall thresholds and source
+annotations/evidence checks; the command never approves fields or changes the registry.
+
+Synthetic tests validate calculations, not production accuracy. Before rollout, annotate independent
+legal, academic, event/administrative, and technical documents across actual corpus languages. Compare
+regex/model extraction on those same references; sweep embedding models/thresholds against annotated
+boundaries. Real annotations, model evaluation, and a cost study remain pending external inputs.
+
+| Capability | Status |
+|---|---|
+| Typed envelopes, legal supported variants, evidence audit | Implemented, offline tested |
+| Generic extraction, cache, budget, dry run, registry migrations | Implemented, fake models tested |
+| Chonkie 1.5.2 optional adapter | Tagged API verified, fake adapter tested; real embeddings unvalidated |
+| Paragraph fallback | Implemented default, explicitly degraded relative to semantic boundaries |
+| CLI/GUI, additive QA references, evaluation command | Implemented opt-in; legacy exports preserved |
+| Production held-out study / embedding calibration / cost study | Pending real annotations/models/operator evaluation |
+
 ## Automatic theme discovery and multidomain synthesis
 
 This extension supersedes the legal-only screening/segmentation and GUI restrictions described

@@ -439,6 +439,43 @@ def _run_review(
         return None, f"Review failed: {exc}", []
 
 
+def _run_metadata(files: Any, folder: str, dry_run: bool, use_model: bool,
+                  max_calls: float, stage_output: str, provider: str, key: str,
+                  base_url: str, metadata_model: str) -> tuple[Any, str, list, list, list[str]]:
+    """Session settings stay in memory; metadata never rewrites earlier stages."""
+    try:
+        from corpus_pipeline.artifacts import read_jsonl
+        from corpus_pipeline.metadata.runner import discover_metadata
+        from corpus_pipeline.settings import load_json
+        paths = _collect_paths(files, folder, {".txt", ".md"})
+        if not paths:
+            return None, "Upload cleaned TXT/MD or select a folder.", [], [], []
+        config = _runtime_config(provider, key, base_url, "", stage_output=stage_output)
+        config.metadata_model = (metadata_model or "").strip()
+        config.metadata_llm_enabled = bool(use_model)
+        config.metadata_max_calls = int(max_calls)
+        result = discover_metadata(paths, config, dry_run=bool(dry_run))
+        output = config.stage_output_dir / "metadata"
+        registry = load_json(output / "field-registry.json")
+        fields = [[row["canonical_label"], row["value_type"], row["scope"], row["occurrence_count"],
+                   row["status"], row["min_confidence"], row["field_id"]] for row in registry.get("fields", [])]
+        queue_path = output / "review-queue.jsonl"
+        queue = read_jsonl(queue_path) if queue_path.is_file() else []
+        reviews = [[row.get("source", ""), row.get("observation", {}).get("label", ""),
+                    row.get("observation", {}).get("status", row.get("status")),
+                    row.get("observation", {}).get("reason", row.get("reason", ""))] for row in queue]
+        status = ("Dry run: no provider calls or embeddings initialized." if dry_run else
+                  f"Metadata: {result['processed']} documents; {result['model_calls']} model calls; "
+                  f"{result['review_cases']} review cases. Shadow mode: training text is unaffected.")
+        names = (("plan.json", "dry-run-summary.json") if dry_run else (
+            "documents.jsonl", "observations.jsonl", "field-registry.json", "registry-history.jsonl",
+            "summary.json", "review-queue.jsonl", "plan.json"))
+        return result, status, fields, reviews, _stage_files(output, names)
+    except STAGE_ERRORS:
+        return None, ("Metadata failed. Check the input files/output permissions; live extraction requires "
+                      "an explicit metadata model and a valid provider key."), [], [], [],
+
+
 def _load_benchmarks(
     benchmark_dir: str,
     reference_dir: str,
@@ -500,7 +537,7 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
         "Each stage has its own tab; use the text generation settings for Stages 3 and 5."
     )
 
-    with gr.Accordion("Text generation settings for Synthesis and LLM Review", open=False):
+    with gr.Accordion("Text generation provider for Synthesis, Metadata and LLM Review", open=False):
         with gr.Row():
             gen_provider = gr.Dropdown(choices=GENERATION_PROVIDERS, value=GENERATION_DEFAULT,
                                        label="Provider", scale=1)
@@ -610,6 +647,32 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
                 label="Automatic theme groups", interactive=False, wrap=True)
             synth_downloads = gr.File(label="Synthesis artifacts", file_count="multiple")
 
+        with gr.Tab("Metadata · shadow mode"):
+            gr.Markdown(
+                "Discover evidence-backed metadata without a predefined field list. Legal structures use "
+                "deterministic extraction; generic documents need explicit model enablement. "
+                "Dry run loads no models. Registry and review tables below include prior corpus runs.")
+            with gr.Row():
+                with gr.Column():
+                    meta_uploads = gr.File(label="Cleaned TXT/MD", file_count="multiple", type="filepath",
+                                           file_types=[".txt", ".md"])
+                    meta_folder = gr.Textbox(label="Or folder of cleaned files")
+                    meta_model = gr.Textbox(label="Metadata text model (METADATA_MODEL)", value=_DEFAULTS.metadata_model)
+                    meta_calls = gr.Number(label="Maximum metadata model calls", value=_DEFAULTS.metadata_max_calls,
+                                           minimum=1, precision=0)
+                with gr.Column():
+                    meta_dry_run = gr.Checkbox(label="Dry run (no provider/embedding calls)", value=True)
+                    meta_live = gr.Checkbox(label="Enable metadata model calls", value=False)
+                    meta_output = gr.Textbox(label="Stage output folder", value=STAGE_OUTPUT_DEFAULT)
+                    meta_run = gr.Button("Run metadata discovery", variant="primary")
+            meta_status = gr.Textbox(label="Metadata status", interactive=False)
+            meta_summary = gr.JSON(label="Metadata plan / summary")
+            meta_fields = gr.Dataframe(headers=["Field", "Type", "Scope", "Documents", "Status", "Min confidence", "ID"],
+                                        label="Discovered field registry", interactive=False, wrap=True)
+            meta_queue = gr.Dataframe(headers=["Source", "Label", "Status", "Reason"], label="Optional review queue",
+                                       interactive=False, wrap=True)
+            meta_downloads = gr.File(label="Metadata artifacts", file_count="multiple")
+
         with gr.Tab("3 · Govern"):
             gr.Markdown(
                 "Screen, deduplicate, and route QA candidates into pass, manual, intercept, "
@@ -701,6 +764,12 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
         outputs=[synth_summary, synth_status, synth_downloads]).then(
             _topic_group_rows, inputs=[synth_stage_output, synth_screening_mode],
             outputs=[synth_topic_groups])
+
+    meta_run.click(
+        _run_metadata,
+        inputs=[meta_uploads, meta_folder, meta_dry_run, meta_live, meta_calls, meta_output,
+                gen_provider, gen_api_key, gen_base_url, meta_model],
+        outputs=[meta_summary, meta_status, meta_fields, meta_queue, meta_downloads])
 
     gov_run.click(
         _run_governance,

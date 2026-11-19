@@ -16,3 +16,6 @@ data/
 *.log
 
 Corpus_Processing_Pipeline.md
+notes.md
+data_processing_examples/
+docs/

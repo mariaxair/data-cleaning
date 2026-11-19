@@ -1,5 +1,41 @@
 # Corpus Processing Pipeline
 
+## Metadata discovery (opt-in, shadow mode)
+
+Use the **Metadata · shadow mode** GUI tab or the commands below after extraction.
+Structured legal documents use regex/heading extraction without an LLM. Other documents
+use open-ended, evidence-backed model observations when explicitly enabled; there is no
+manual field inventory. Fields accumulate in a versioned registry, and ambiguous mappings
+remain in a review queue. Nothing changes existing training/OCR exports by default.
+
+```powershell
+# Plan only: no provider calls, model initialization, or registry mutation.
+.\.venv\Scripts\python.exe cli.py --metadata --dry-run --folder data/ocr-out
+# Legal extraction offline; generic documents remain extraction_pending.
+.\.venv\Scripts\python.exe cli.py --metadata --folder data/ocr-out
+# Optional generic extraction: set METADATA_MODEL and the provider key in .env first.
+.\.venv\Scripts\python.exe cli.py --metadata --metadata-llm --metadata-max-calls 100 --folder data/ocr-out
+# Evaluate operator-authored annotations (format documented in docs/PIPELINE.md).
+.\.venv\Scripts\python.exe cli.py --metadata-evaluate data/metadata-reference.jsonl
+# Optional references only; QA generation does not depend on metadata.
+.\.venv\Scripts\python.exe cli.py --synthesize --screening-mode automatic --with-metadata --folder data/ocr-out
+```
+
+Artifacts live under `data/training/metadata/`: `documents.jsonl`, `observations.jsonl`,
+`field-registry.json`, append-only `registry-history.jsonl`, `review-queue.jsonl`, and
+`summary.json`. Dry runs write only `plan.json`/`dry-run-summary.json`. Reruns reuse
+validated request caches and count each content-identical document once per registry field.
+
+Semantic chunking is optional: install `requirements-semantic.txt` only if needed, set
+`METADATA_EMBEDDING_MODEL` explicitly, then enable `METADATA_SEMANTIC_ENABLED=true`.
+Chonkie **1.5.2** is pinned and its public API was checked; integration is tested with fakes.
+Real embeddings and Arabic/French boundary quality have **not** been benchmarked here.
+The default paragraph fallback preserves exact text and reports degraded mode explicitly.
+Legal boundaries always take priority. Skip-window merging is rejected.
+
+See [the metadata engineering guide](docs/PIPELINE.md#metadata-discovery-shadow-stage) and
+[implementation status / remaining rollout work](docs/METADATA_DISCOVERY_PLAN.md#implementation-status).
+
 ## Automatic themes across all domains
 
 The Synthesis tab now defaults to **Automatic themes · all domains**. The configured text model

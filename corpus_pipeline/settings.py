@@ -65,6 +65,46 @@ class TrainingSettings:
     review_llm_enabled: bool = field(default_factory=lambda: env_bool("REVIEW_LLM_ENABLED"))
     review_max_attempts: int = field(default_factory=lambda: int(os.getenv("REVIEW_MAX_ATTEMPTS", "2")))
     stage_output_dir: Path = field(default_factory=lambda: Path(os.getenv("STAGE_OUTPUT_DIR", "data/training")))
+    metadata_enabled: bool = field(default_factory=lambda: env_bool("METADATA_ENABLED"))
+    metadata_llm_enabled: bool = field(default_factory=lambda: env_bool("METADATA_LLM_ENABLED"))
+    metadata_model: str = field(default_factory=lambda: os.getenv("METADATA_MODEL", ""))
+    metadata_max_calls: int = field(default_factory=lambda: int(os.getenv("METADATA_MAX_CALLS", "100")))
+    metadata_max_attempts: int = field(default_factory=lambda: int(os.getenv("METADATA_MAX_ATTEMPTS", "2")))
+    metadata_max_tokens: int = field(default_factory=lambda: int(os.getenv("METADATA_MAX_TOKENS", "4096")))
+    metadata_chunk_chars: int = field(default_factory=lambda: int(os.getenv("METADATA_CHUNK_CHARS", "6000")))
+    metadata_semantic_enabled: bool = field(default_factory=lambda: env_bool("METADATA_SEMANTIC_ENABLED"))
+    metadata_embedding_model: str = field(default_factory=lambda: os.getenv("METADATA_EMBEDDING_MODEL", ""))
+    metadata_semantic_threshold: float = field(default_factory=lambda: float(os.getenv("METADATA_SEMANTIC_THRESHOLD", "0.8")))
+    metadata_chunk_tokens: int = field(default_factory=lambda: int(os.getenv("METADATA_CHUNK_TOKENS", "2048")))
+    metadata_similarity_window: int = field(default_factory=lambda: int(os.getenv("METADATA_SIMILARITY_WINDOW", "3")))
+    metadata_skip_window: int = field(default_factory=lambda: int(os.getenv("METADATA_SKIP_WINDOW", "0")))
+    metadata_delimiters: list[str] = field(default_factory=lambda: json.loads(os.getenv(
+        "METADATA_DELIMITERS", '[". ", "! ", "? ", "؟", "؛", "\\n"]')))
+    metadata_include_delim: str = field(default_factory=lambda: os.getenv("METADATA_INCLUDE_DELIM", "prev"))
+    metadata_match_threshold: float = field(default_factory=lambda: float(os.getenv("METADATA_MATCH_THRESHOLD", "0.95")))
+    metadata_match_margin: float = field(default_factory=lambda: float(os.getenv("METADATA_MATCH_MARGIN", "0.1")))
+    metadata_promotion_documents: int = field(default_factory=lambda: int(os.getenv("METADATA_PROMOTION_DOCUMENTS", "5")))
+    metadata_min_confidence: float = field(default_factory=lambda: float(os.getenv("METADATA_MIN_CONFIDENCE", "0.9")))
+    synthesis_metadata_enabled: bool = field(default_factory=lambda: env_bool("SYNTHESIS_METADATA_ENABLED"))
+    metadata_eval_min_precision: float = field(default_factory=lambda: float(os.getenv("METADATA_EVAL_MIN_PRECISION", "0.98")))
+    metadata_eval_min_recall: float = field(default_factory=lambda: float(os.getenv("METADATA_EVAL_MIN_RECALL", "0.9")))
+    metadata_eval_min_examples: int = field(default_factory=lambda: int(os.getenv("METADATA_EVAL_MIN_EXAMPLES", "20")))
+
+    def validate_metadata(self) -> None:
+        """Validate only metadata knobs so legacy commands keep their defaults."""
+        if min(self.metadata_max_calls, self.metadata_max_attempts, self.metadata_max_tokens,
+               self.metadata_chunk_chars, self.metadata_chunk_tokens, self.metadata_similarity_window,
+               self.metadata_promotion_documents, self.metadata_eval_min_examples) < 1:
+            raise ValueError("Metadata budgets, chunk sizes, windows, and recurrence must be positive.")
+        if self.metadata_skip_window != 0:
+            raise ValueError("METADATA_SKIP_WINDOW must be 0: canonical chunks must remain contiguous.")
+        if self.metadata_include_delim not in {"prev", "next"} or not self.metadata_delimiters or any(
+                not isinstance(item, str) or not item for item in self.metadata_delimiters):
+            raise ValueError("Metadata delimiter policy must retain nonempty delimiters (prev or next).")
+        if any(not 0 <= value <= 1 for value in (self.metadata_semantic_threshold, self.metadata_match_threshold,
+                                                self.metadata_match_margin, self.metadata_min_confidence,
+                                                self.metadata_eval_min_precision, self.metadata_eval_min_recall)):
+            raise ValueError("Metadata thresholds must be between 0 and 1.")
 
     def validate_training(self) -> None:
         """Reject unsafe cost controls and invalid threshold ordering."""

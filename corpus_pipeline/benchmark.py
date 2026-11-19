@@ -35,6 +35,93 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from config import PipelineConfig
     from .models import PageReport
 
+
+def evaluate_metadata(documents_path: Path, references_path: Path, output_path: Path, *,
+                      min_precision: float = 0.98, min_recall: float = 0.9, min_examples: int = 20) -> dict:
+    """Evaluate operator annotations; smoke fixtures never count as a held-out study."""
+    from .artifacts import fingerprint
+    documents, references = read_jsonl(documents_path), read_jsonl(references_path)
+    by_id = {row["document_id"]: row for row in documents}
+    by_source = {row["source"]: row for row in documents}
+    tp = fp = fn = evidence_ok = evidence_total = unknown = mapping_errors = mapping_total = 0
+    boundary_tp = boundary_fp = boundary_fn = reconstruction_ok = exact_documents = 0
+    counts, fields = Counter(), {}
+    for reference in references:
+        document = by_id.get(reference.get("document_id", reference.get("source_sha256"))) or by_source.get(reference.get("source"))
+        expected = reference.get("observations", [])
+        if not isinstance(expected, list):
+            raise ValueError("Reference observations must be an array.")
+        actual = document.get("metadata", []) if document else []
+        key = lambda row: fingerprint([row["label"], row["value"], row.get("scope", "document")])
+        expected_map, actual_map = {key(row): row for row in expected}, {key(row): row for row in actual}
+        matches = expected_map.keys() & actual_map.keys()
+        exact_documents += bool(document is not None and expected_map.keys() == actual_map.keys())
+        tp += len(matches)
+        fp += len(actual_map.keys() - expected_map.keys())
+        fn += len(expected_map.keys() - actual_map.keys())
+        for item_key in expected_map.keys() | actual_map.keys():
+            label = (expected_map.get(item_key) or actual_map[item_key])["label"]
+            stats = fields.setdefault(label, Counter())
+            stats["tp" if item_key in matches else "fp" if item_key in actual_map else "fn"] += 1
+        for item_key in matches:
+            expected_field = expected_map[item_key].get("expected_field_id")
+            if expected_field is not None:
+                mapping_total += 1
+                mapping_errors += actual_map[item_key].get("field_id") != expected_field
+        if not document:
+            counts["missing_documents"] += 1
+            unknown += 1
+            continue
+        chunks = document.get("chunks", [])
+        rebuilt = "".join(chunk["text"] for chunk in chunks)
+        source = reference.get("source_text", rebuilt)
+        reconstruction_ok += (rebuilt == source and all(source[c["start"]:c["end"]] == c["text"] for c in chunks))
+        counts["source_annotations" if "source_text" in reference else "reconstruction_only"] += 1
+        unknown += document.get("metadata_status") != "complete"
+        for observation in actual:
+            citations = observation.get("evidence", [])
+            evidence_total += 1
+            evidence_ok += bool(citations) and all(type(e.get("start")) is int and type(e.get("end")) is int and
+                0 <= e["start"] < e["end"] <= len(source) and source[e["start"]:e["end"]] == e["quote"] for e in citations)
+        if "chunk_boundaries" in reference:
+            predicted = {c["end"] for c in chunks[:-1]}
+            annotated = set(reference["chunk_boundaries"])
+            boundary_tp += len(predicted & annotated)
+            boundary_fp += len(predicted - annotated)
+            boundary_fn += len(annotated - predicted)
+            counts["boundary_annotations"] += 1
+    ratio = lambda a, b: a / b if b else None
+    precision, recall = ratio(tp, tp + fp), ratio(tp, tp + fn)
+    field_results = {}
+    for label, stats in sorted(fields.items()):
+        p, r = ratio(stats["tp"], stats["tp"] + stats["fp"]), ratio(stats["tp"], stats["tp"] + stats["fn"])
+        field_results[label] = {**dict(stats), "precision": p, "recall": r,
+                                "quality_eligible": (stats["tp"] + stats["fn"] >= min_examples and
+                                                     p is not None and r is not None and p >= min_precision and r >= min_recall)}
+    eligible = (bool(references) and counts["source_annotations"] == len(references) and
+                evidence_total > 0 and evidence_ok == evidence_total)
+    for row in field_results.values():
+        row["quality_eligible"] = row["quality_eligible"] and eligible
+    summary = {"schema_version": "1.0", "reference_documents": len(references),
+               "field_exact_match": tp, "false_positive": fp, "false_negative": fn,
+               "precision": precision, "recall": recall,
+               "exact_document_rate": ratio(exact_documents, len(references)),
+               "evidence_support_rate": ratio(evidence_ok, evidence_total),
+               "unknown_abstention_rate": ratio(unknown, len(references)),
+               "field_match_error_rate": ratio(mapping_errors, mapping_total),
+               "field_merge_error_rate": ratio(mapping_errors, mapping_total),
+               "chunk_boundary_precision": ratio(boundary_tp, boundary_tp + boundary_fp),
+               "chunk_boundary_recall": ratio(boundary_tp, boundary_tp + boundary_fn),
+               "source_reconstruction_rate": ratio(reconstruction_ok, len(references)),
+               "annotation_coverage": dict(counts), "fields": field_results,
+               "thresholds": {"min_precision": min_precision, "min_recall": min_recall, "min_examples": min_examples},
+               "registry_modified": False,
+               "note": "Eligibility is a signal, not automatic quality approval; verify held-out annotations and review migrations.",
+               "latency_s": sum(row.get("processing", {}).get("elapsed_s", 0) for row in documents),
+               "cost": None, "cost_reason": "Supply provider pricing externally; no estimated price is invented."}
+    write_json(output_path, summary)
+    return summary
+
 SCHEMA_VERSION = 1
 
 # Page markers written by _join_pages, e.g. "\n\n--- Page 12 ---\n\n".
