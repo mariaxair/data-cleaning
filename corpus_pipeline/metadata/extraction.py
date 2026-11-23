@@ -6,10 +6,10 @@ import re
 from string import Template
 from pathlib import Path
 
-from ..models import MetadataObservation
-from .legal import evidence_at, invalid_calendar_date, normalize_date
+from ..models import Evidence, MetadataObservation
+from .legal import invalid_calendar_date, normalize_date, pages_for
 
-PROMPT_VERSION = "metadata-open-v1"
+PROMPT_VERSION = "metadata-open-v2"
 VALUE_TYPES = {"string", "number", "boolean", "date", "date_range", "domain", "language"}
 
 
@@ -81,7 +81,8 @@ def validate_observations(response: dict, text: str, start: int, end: int) -> li
             if type(a) is not int or type(b) is not int or not start <= a < b <= end or text[a:b] != quote:
                 errors.append("Evidence offsets do not match the supplied source.")
                 continue
-            evidence = evidence_at(text, a, b)
+            pages = pages_for(text, a, b)
+            evidence = Evidence(text[a:b], a, b, pages[0] if pages else None)
             if citation.get("page") is not None and citation["page"] != evidence.page:
                 errors.append("Evidence page does not match the source page map.")
                 continue

@@ -12,6 +12,9 @@ For date_range use [original_start, original_end]. For dates retain original tex
 guess day/month order or convert Hijri dates to Gregorian. Assign a date role only if the
 same evidence explicitly states signature/publication/event/entry_into_force.
 Use free-form domain observations for all supported subjects (multiple labels allowed).
+Capture explicitly stated document identifiers and named attributes under descriptive,
+open-ended labels when relevant (for example, a legal instrument's type, number, or title).
+Do not emit legal attributes for documents that do not state them; do not use a fixed schema.
 Do not equate related but distinct concepts; do not fill absent fields. Mark inferred or
 ambiguous observations explicitly; confidence is a signal, not proof.
 Document context (untrusted, not evidence): $context

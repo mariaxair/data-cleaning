@@ -190,7 +190,7 @@ def test_gui_automatic_dry_run_needs_no_manual_overrides(tmp_path):
     from app import _run_synthesis
     path = sources(tmp_path)[0]
     summary, status, artifacts = _run_synthesis(
-        [str(path)], "", None, "", 10, True, str(tmp_path / "gui"), "heiyu", "",
+        [str(path)], "", "", 10, True, str(tmp_path / "gui"), "heiyu", "",
         "https://example.invalid/v1", "", "automatic", False, 10)
     assert summary["selected_units"] > 0
     assert "no model calls" in status and "themes pending" in status

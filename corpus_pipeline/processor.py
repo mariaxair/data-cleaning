@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from config import PipelineConfig
 from .cache import PipelineCache
-from .cleaning import clean_text
+from .cleaning import CleaningResult, clean_text
 from .extraction import PdfPageSource, extract_docx, extract_text_file
 from .models import PageReport, PageRoute
 from .ocr.registry import create_adapter
@@ -26,7 +26,7 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _config_hash(config: PipelineConfig) -> str:
+def _config_hash(config: PipelineConfig, apply_cleaning: bool = True) -> str:
     """Hash output-affecting settings, excluding API credentials."""
     values = {
         "languages": config.languages,
@@ -37,7 +37,9 @@ def _config_hash(config: PipelineConfig) -> str:
         "base_url": config.ocr_base_url,
         "model": config.ocr_model,
     }
-    if config.semantic_rules_enabled:
+    if not apply_cleaning:
+        values["stage"] = "ocr_only"
+    if apply_cleaning and config.semantic_rules_enabled:
         values["semantic_rules"] = [
             "v1",
             _sha256(config.rules_data_path.read_bytes()) if config.rules_data_path.is_file() else "",
@@ -113,6 +115,7 @@ def _process_pdf(
     cache: PipelineCache,
     semaphore: threading.BoundedSemaphore | None,
     progress: ProgressCallback | None,
+    apply_cleaning: bool = True,
 ) -> tuple[list[str], list[str], list[PageReport]]:
     """Route every page, OCR the scanned ones in parallel, and keep page order."""
     with PdfPageSource(source, config.render_dpi) as pdf:
@@ -169,6 +172,8 @@ def _process_pdf(
                     report.ocr_from_cache = from_cache
                     report.warnings.extend(warnings)
 
+        if not apply_cleaning:
+            return texts, texts, page_reports
         if progress:
             progress(f"Cleaning {source.name}: {len(page_reports)} pages")
         cleaned_pages: list[str] = []
@@ -187,6 +192,7 @@ def process_file(
     progress: ProgressCallback | None = None,
     force: bool = False,
     ocr_semaphore: threading.BoundedSemaphore | None = None,
+    apply_cleaning: bool = True,
 ) -> dict[str, Any]:
     """Process one supported file and emit TXT plus a JSON route report."""
     source = Path(path)
@@ -198,7 +204,7 @@ def process_file(
         progress(f"Reading {source.name}")
     source_hash = _sha256(source.read_bytes())
     source_key = str(source.resolve())
-    config_hash = _config_hash(config)
+    config_hash = _config_hash(config, apply_cleaning)
     cache = PipelineCache(config.cache_db)
     adapter = ocr_adapter or create_adapter(config)
     semaphore = ocr_semaphore
@@ -208,7 +214,7 @@ def process_file(
     output_path = config.output_dir / f"{stem}.txt"
     report_path = config.output_dir / f"{stem}.report.json"
 
-    if not force and cache.is_complete(source_key, source_hash, config_hash):
+    if not force and cache.is_complete(source_key, source_hash, config_hash) and output_path.is_file() and report_path.is_file():
         existing_metrics = config.output_dir / f"{stem}.metrics.json"
         if progress:
             progress(f"Skipped (already processed): {source.name}")
@@ -226,19 +232,21 @@ def process_file(
 
     if extension == ".pdf":
         original_pages, cleaned_pages, page_reports = _process_pdf(
-            source, config, adapter, cache, semaphore, progress,
+            source, config, adapter, cache, semaphore, progress, apply_cleaning,
         )
     elif extension in {".txt", ".md"}:
         text = extract_text_file(source)
         original_pages = [text]
-        cleaned = clean_text(text, config.languages, config=config)
+        cleaned = (clean_text(text, config.languages, config=config) if apply_cleaning
+                   else CleaningResult(text, {}))
         cleaned_pages = [cleaned.text]
         signals = measure_page(text, 0.0)
         page_reports.append(PageReport(1, PageRoute.DIGITAL, signals, cleaning_hits=cleaned.hit_counts))
     elif extension == ".docx":
         text = extract_docx(source)
         original_pages = [text]
-        cleaned = clean_text(text, config.languages, config=config)
+        cleaned = (clean_text(text, config.languages, config=config) if apply_cleaning
+                   else CleaningResult(text, {}))
         cleaned_pages = [cleaned.text]
         signals = measure_page(text, 0.0)
         page_reports.append(PageReport(1, PageRoute.DIGITAL, signals, cleaning_hits=cleaned.hit_counts))
@@ -274,7 +282,10 @@ def process_file(
         "warnings": [warning for item in page_reports for warning in item.warnings],
         "pages": [item.to_dict() for item in page_reports],
     }
-    if config.semantic_rules_enabled:
+    if not apply_cleaning:
+        report_data.update(stage="ocr", page_texts=original_pages,
+                           page_markers=[config.include_page_markers, config.page_marker_template])
+    if apply_cleaning and config.semantic_rules_enabled:
         from .rules.tables import load_table
         from .settings import load_json
         domain = load_json(config.rules_data_path)
@@ -340,6 +351,7 @@ def process_batch(
     progress: ProgressCallback | None = None,
     force: bool = False,
     ocr_adapter: Any | None = None,
+    apply_cleaning: bool = True,
 ) -> dict[str, Any]:
     """Process a group of files concurrently and summarize outcomes in input order."""
     targets = [Path(path) for path in paths]
@@ -361,7 +373,7 @@ def process_batch(
         try:
             return process_file(
                 path, config, ocr_adapter=adapter, progress=emit,
-                force=force, ocr_semaphore=semaphore,
+                force=force, ocr_semaphore=semaphore, apply_cleaning=apply_cleaning,
             )
         except Exception as exc:
             logging.getLogger("corpus_pipeline").error(

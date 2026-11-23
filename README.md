@@ -2,16 +2,18 @@
 
 ## Metadata discovery (opt-in, shadow mode)
 
-Use the **Metadata · shadow mode** GUI tab or the commands below after extraction.
-Structured legal documents use regex/heading extraction without an LLM. Other documents
-use open-ended, evidence-backed model observations when explicitly enabled; there is no
-manual field inventory. Fields accumulate in a versioned registry, and ambiguous mappings
-remain in a review queue. Nothing changes existing training/OCR exports by default.
+Use **Synthesis → Chunking / Metadata** in the GUI or the legacy CLI commands below after extraction.
+Legal syntax is recognized deterministically only to preserve document/article boundaries and
+route downstream synthesis. Content metadata for all readable document types, including legal
+identifiers and types, comes from open-ended, evidence-backed model observations when explicitly
+enabled; there is no fixed per-domain metadata inventory. Fields accumulate in a versioned
+registry, and ambiguous mappings remain in a review queue. Nothing changes existing training/OCR
+exports by default.
 
 ```powershell
 # Plan only: no provider calls, model initialization, or registry mutation.
 .\.venv\Scripts\python.exe cli.py --metadata --dry-run --folder data/ocr-out
-# Legal extraction offline; generic documents remain extraction_pending.
+# Metadata/chunk processing without model extraction; discovered content metadata remains pending.
 .\.venv\Scripts\python.exe cli.py --metadata --folder data/ocr-out
 # Optional generic extraction: set METADATA_MODEL and the provider key in .env first.
 .\.venv\Scripts\python.exe cli.py --metadata --metadata-llm --metadata-max-calls 100 --folder data/ocr-out
@@ -21,20 +23,42 @@ remain in a review queue. Nothing changes existing training/OCR exports by defau
 .\.venv\Scripts\python.exe cli.py --synthesize --screening-mode automatic --with-metadata --folder data/ocr-out
 ```
 
-Artifacts live under `data/training/metadata/`: `documents.jsonl`, `observations.jsonl`,
+CLI artifacts live under `data/training/metadata/` (GUI: `data/synthesis/metadata/`): `documents.jsonl`, `observations.jsonl`,
 `field-registry.json`, append-only `registry-history.jsonl`, `review-queue.jsonl`, and
 `summary.json`. Dry runs write only `plan.json`/`dry-run-summary.json`. Reruns reuse
 validated request caches and count each content-identical document once per registry field.
 
 Semantic chunking is optional: install `requirements-semantic.txt` only if needed, set
 `METADATA_EMBEDDING_MODEL` explicitly, then enable `METADATA_SEMANTIC_ENABLED=true`.
-Chonkie **1.5.2** is pinned and its public API was checked; integration is tested with fakes.
+Chonkie **1.7.0** is pinned and its wheel's public API was checked. On this Windows/Python 3.15
+environment installation is currently blocked: `chonkie-core 0.10.2` has no compatible binary wheel,
+and its source build uses PyO3 0.27.2, which supports Python only through 3.14. Updating Chonkie alone
+does not resolve that native dependency. Keep the existing venv; the deterministic fallback works.
+The optional real `SemanticChunker` import/offset tests run when a compatible installation exists;
+they skip if Chonkie is absent and fail if an installed package cannot import. Offline fake adapters
+cover failure handling and exact reconstruction. No model weights are downloaded by tests.
 Real embeddings and Arabic/French boundary quality have **not** been benchmarked here.
 The default paragraph fallback preserves exact text and reports degraded mode explicitly.
 Legal boundaries always take priority. Skip-window merging is rejected.
 
 See [the metadata engineering guide](docs/PIPELINE.md#metadata-discovery-shadow-stage) and
 [implementation status / remaining rollout work](docs/METADATA_DISCOVERY_PLAN.md#implementation-status).
+
+### Chunk quality evaluation
+
+After creating chunks, run the optional LLM-judge benchmark from this directory:
+
+```powershell
+.\.venv\Scripts\python.exe cli.py --chunk-evaluate data/synthesis/chunking/chunks.jsonl `
+  --chunk-judge-model YOUR_TEXT_MODEL --chunk-judge-max-calls 100
+```
+
+The judge uses the configured OpenAI-compatible provider/key and scores coherence, completeness,
+and whether each chunk can stand alone. The report is written to
+`data/synthesis/chunking/evaluation.json`; low scores and deterministic size/source-offset problems
+are flagged. Increase the call budget to cover more chunks, or set it to `0` for integrity/size
+checks only. This is a triage signal, not ground truth; the source file must still be available at
+its saved provenance path for exact offset checks.
 
 ## Automatic themes across all domains
 
@@ -72,7 +96,7 @@ for costs, cache behavior, new settings, and limitations of model-based grouping
 
 This project extracts and cleans PDF, TXT, Markdown, and DOCX files for downstream model training. PDF routing is page by page: good text layers are kept, low text or image dominated pages go to OCR, and corrupted text layers are marked SUSPECT and sent to OCR. OCR results are cached by rendered page hash, provider, model, and endpoint. File completion records make successful runs resumable.
 
-Files and pages are processed concurrently. A batch runs up to `FILE_CONCURRENCY` files at once, each file OCRs up to `PAGE_CONCURRENCY` pages at once, and `OCR_CONCURRENCY` caps simultaneous provider calls across the whole run. Defaults are 4/4/4; lower them if the provider rate-limits the account, or raise them for more throughput. Setting a limit to `0` removes that cap: `PAGE_CONCURRENCY=0` submits every scanned page of a document at once, and `OCR_CONCURRENCY=0` removes the batch-wide provider cap, so it must also be `0` if all pages should run together. `FILE_CONCURRENCY=0` starts every document immediately. These are exposed in the GUI under **Concurrency** in the Extract tab. Unlimited bursts can exhaust memory or trigger provider throttling; raise limits gradually. Page order in the output is always the original PDF order, and a failed page never aborts the rest of the document.
+Files and pages are processed concurrently. A batch runs up to `FILE_CONCURRENCY` files at once, each file OCRs up to `PAGE_CONCURRENCY` pages at once, and `OCR_CONCURRENCY` caps simultaneous provider calls across the whole run. Defaults are 4/4/4; lower them if the provider rate-limits the account, or raise them for more throughput. Setting a limit to `0` removes that cap: `PAGE_CONCURRENCY=0` submits every scanned page of a document at once, and `OCR_CONCURRENCY=0` removes the batch-wide provider cap, so it must also be `0` if all pages should run together. `FILE_CONCURRENCY=0` starts every document immediately. These are exposed in the GUI under **Concurrency** in the OCR tab. Unlimited bursts can exhaust memory or trigger provider throttling; raise limits gradually. Page order in the output is always the original PDF order, and a failed page never aborts the rest of the document.
 
 The GUI uses Gradio because it provides a compact local interface for masked settings, file uploads, progress, tables, previews, and downloads without a separate frontend build.
 
@@ -111,17 +135,90 @@ Copy `.env.example` to `.env` and fill in the keys for the providers you use. Th
     python cli.py --compare-benchmarks
     python app.py
 
-The GUI listens on the local Gradio address printed at startup. Selecting a provider automatically loads that provider's base URL, model, and API key (from `.env`), so switching providers only requires choosing it from the dropdown. Typed values override `.env` for the current session only. The GUI has one tab per pipeline stage:
+The GUI listens on the local Gradio address printed at startup. Selecting a provider automatically loads that provider's base URL, model, and API key (from `.env`), so switching providers only requires choosing it from the dropdown. Typed values override `.env` for the current session only. The GUI has one tab per pipeline stage (all new GUI outputs default under `data/`):
 
 | Tab | Purpose |
 | --- | --- |
-| **1 · Extract & clean** | Upload files or a folder, run extraction, inspect per-file/page reports and previews, download TXT. |
-| **2 · Synthesize** | Generate QA candidates from cleaned TXT/MD; dry run by default, with optional manual overrides. |
-| **3 · Govern** | Screen and deduplicate QA JSONL into pass/manual/intercept/duplicate buckets. Offline. |
-| **4 · Review** | Score governed records; deterministic by default, or model review/repair when enabled. |
-| **5 · Benchmarks** | Refresh provider/model comparisons from benchmark history, show CER/WER and reference coverage. |
+| **1 - OCR** | Per-page routing, extraction/OCR, raw text and page reports in `data/ocr/`. Benchmarks are a collapsed panel here. |
+| **2 - Cleaning** | Independent format-cleaning and deterministic-correction switches; previews, TXT and rule counters in `data/cleaning/`. |
+| **3 - Synthesis** | Chunking → metadata extraction → question agent → answer agent. Optional Chonkie/embedding controls are here. |
+| **4 - Governance** | Screen/deduplicate `data/synthesis/qa.jsonl`; write pass/manual/intercept/duplicates in `data/governance/`. |
+| **5 - Review** | Score/repair governed QA; accepted/rejected/manual and audit files in `data/review/`. |
+| **6 - Corpus** | Export accepted QA to `data/corpus/corpus.jsonl`, with separate provenance and summary. |
 
-The extraction tab keeps multiple uploads or a folder path, per-file and per-page reports, side-by-side previews, and TXT downloads. A shared collapsible **Text generation settings** section above the tabs supplies the provider, key, base URL, and text model used by Synthesis and LLM Review. It is separate from the OCR vision model, and live synthesis or LLM review refuses to start without `SYNTHESIS_MODEL`. Explicit uploads take precedence over prefilled folder or path fields.
+Synthesis writes `data/synthesis/chunking/chunks.jsonl`, `metadata/`,
+`questions/questions.jsonl`, `answers/answers.jsonl`, and `qa.jsonl`. Chunk exports carry source text,
+language, source identity, and provenance; open-ended, evidence-backed discoveries are stored in
+the `metadata` array rather than forced into legal-only columns. Legal structure is used to preserve
+boundaries and route synthesis, not to fabricate `law_number` or `law_type` metadata. Questions add
+`uuid`, `instruction`, `prompt_Q`; answers add `output`, `prompt_A`. Technical provenance and quality flags are additive. Review retains its structured dimension scores instead of copying
+the example's misspelled `socre` free-text field. The training export contains only
+`instruction`, `input` (empty), and `output`; source text/prompts remain in the earlier audit artifacts.
+
+### Automated quality judging
+
+The benchmark module can run deterministic chunk/source-integrity checks and use the configured
+OpenAI-compatible text-generation provider as an opt-in LLM judge. Metadata judging checks cited
+evidence against source text; QA judging considers the question/answer and source passage; review
+judging independently assesses the saved review decision and scores. Reports are separate from
+production JSONL and all judge calls are bounded (default 100 records per run; set the budget to 0
+for deterministic checks only). LLM scores are triage signals, not ground truth.
+
+```powershell
+# Chunk coherence plus source/offset integrity; uses SYNTHESIS_MODEL unless overridden.
+.\.venv\Scripts\python.exe cli.py --chunk-evaluate data/synthesis/chunking/chunks.jsonl
+# Evaluate one other saved artifact at a time. Reports go under <stage-output>/evaluation/.
+.\.venv\Scripts\python.exe cli.py --metadata-quality-evaluate data/training/metadata/documents.jsonl
+.\.venv\Scripts\python.exe cli.py --qa-quality-evaluate data/training/synthesis/qa.jsonl
+.\.venv\Scripts\python.exe cli.py --review-quality-evaluate data/training/review/audit.jsonl
+# Deterministic evidence/source checks without model calls.
+.\.venv\Scripts\python.exe cli.py --qa-quality-evaluate data/training/synthesis/qa.jsonl --quality-judge-max-calls 0
+```
+
+Run `.\.venv\Scripts\python.exe app.py`, then follow the six tabs in order. In Synthesis,
+disable its metadata dry run to save actual chunks; **1. Chunk text** makes no metadata API calls.
+Use **2. Extract metadata** with the model checkbox enabled for generic extraction. Then disable
+the agent dry run, choose a text model/key, run **3. Generate questions**, and **4. Generate answers**.
+The answer button reuses question checkpoints; it also generates the existing public explanation.
+Dry runs create plans only, not usable new chunks/QA. Generic metadata and dialect checks remain
+explicitly degraded/pending when no model is enabled. Offline Review can route records to manual;
+Corpus never promotes them automatically.
+
+The OCR tab keeps uploads/folder selection, per-file and per-page reports, raw text previews, and
+TXT/JSON downloads. Operational settings can be changed directly in the GUI: no PowerShell
+environment commands or configuration-file edits are needed. Advanced controls stay collapsed.
+Edits override only the current session and are never written to `.env` or `config.py`.
+
+- **Metadata:** enable/disable **Use Chonkie semantic chunking**, then select an embedding preset
+  or type a custom model ID/local folder. Model choice is editable only while semantic chunking is
+  enabled. Disable **Dry run** to run it. Model API extraction has its own checkbox and model field.
+- **OCR:** page markers/template, languages (including custom hints), routing
+  thresholds, DPI, concurrency, retries, benchmark options, force reprocessing, optional OCR connection
+  test are available. **Cleaning** contains the independent format and semantic switches,
+  correction tables and aggregated rule-counter downloads.
+- **Synthesis:** screening mode, discovery-only, dry run, budgets, generation limits, segmentation,
+  screening/override files and metadata provenance references are available. Overrides default to
+  empty, so a missing optional example file cannot block a run.
+- **Governance/review:** shared language/dialect controls select lexicon or local MARBERT and their
+  paths/thresholds. Review adds a model toggle, repair limit and response token limit.
+- **Metadata evaluation:** upload annotations and set precision/recall/example thresholds in its
+  own panel. Benchmark comparison uses the shared history/reference folders.
+
+The GUI output root defaults to `data` and is selected once above the tabs; changing it updates
+the suggested inputs for Cleaning, Synthesis, Governance, Review and Corpus. Existing files are
+not moved. Legacy CLI commands/default paths and `process_file`'s combined extraction/cleaning
+behavior remain compatible. Benchmark folders, dialect settings, and text-provider
+timeouts/retries also have one shared control group rather than copies in every tab. OCR retains
+its own transport settings. Text-provider/key/URL settings apply to Synthesis, Metadata and Review;
+the synthesis/review model and metadata model remain explicit separate choices. Emptying a model or
+override field really overrides its environment default. Explicit synthesis/governance/review uploads
+take precedence over prefilled input paths.
+
+Stage **Run** buttons replace the CLI stage-selection flags (`SYNTHESIS_ENABLED`, `METADATA_ENABLED`,
+`CORPUS_PROCESSING_ENABLED`, `REVIEW_ENABLED`); they need no extra checkboxes. Noncontiguous merging
+(`METADATA_SKIP_WINDOW`) stays fixed at zero to preserve source order, rather than offering an invalid
+setting. CLI output paths become GUI downloads; no duplicate filename options are required. All other
+runtime `PipelineConfig` fields have a control or direct file/model/provider selector.
 
 ## OCR providers
 

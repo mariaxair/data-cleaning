@@ -7,14 +7,17 @@ from importlib.metadata import version
 from config import PipelineConfig
 from .legal import pages_for
 
+CHONKIE_VERSION = "1.7.0"
+
 
 def _semantic(config: PipelineConfig):
     """Explicit enablement may initialize the operator-selected embedding model."""
-    from chonkie import SemanticChunker
-    if version("chonkie") != "1.5.2":
-        raise ValueError("Unsupported optional chunker version.")
+    if version("chonkie") != CHONKIE_VERSION:
+        raise ValueError(f"Unsupported optional chunker version; expected {CHONKIE_VERSION}.")
     if not config.metadata_embedding_model.strip():
         raise ValueError("Set an embedding model explicitly.")
+    from chonkie import SemanticChunker
+    # 1.7.0 retains these public arguments and Chunk's character-index fields.
     return SemanticChunker(
         embedding_model=config.metadata_embedding_model, threshold=config.metadata_semantic_threshold,
         chunk_size=config.metadata_chunk_tokens, similarity_window=config.metadata_similarity_window,
@@ -59,14 +62,14 @@ def chunk_document(text: str, config: PipelineConfig, *, legal_spans: list[dict]
                     start, end = item.start_index, item.end_index
                     if (type(start) is not int or type(end) is not int or start != cursor or
                             not start < end <= len(text) or text[start:end] != item.text or
-                            type(item.token_count) is not int or item.token_count > config.metadata_chunk_tokens or
+                            type(item.token_count) is not int or not 0 <= item.token_count <= config.metadata_chunk_tokens or
                             end - start > config.metadata_chunk_chars):
                         raise ValueError("Unverified semantic chunk offsets/size.")
                     candidate.append({"start": start, "end": end, "token_count": item.token_count})
                     cursor = end
                 if cursor != len(text):
                     raise ValueError("Incomplete semantic reconstruction.")
-                spans, selected = candidate, "chonkie_semantic_1.5.2"
+                spans, selected = candidate, f"chonkie_semantic_{CHONKIE_VERSION}"
             except Exception:
                 # Exceptions can contain paths/credentials; keep a fixed, actionable reason.
                 reason = "Semantic chunking unavailable or failed source/size validation; using deterministic fallback."

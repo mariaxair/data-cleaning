@@ -91,7 +91,9 @@ def _prepare(path: Path, config: PipelineConfig, dry_run: bool, chunker=None) ->
     document.processing["source_damaged"] = damaged
     if damaged or document.processing["source_partial"]:
         document.warnings.append("Damaged or partial source requires review; model extraction is deferred.")
-    windows = _windows(text, chunks, config) if legal["status"] != "complete" and not damaged and not document.processing["source_partial"] else []
+    # Chunk boundaries can be structurally legal while metadata remains open-ended:
+    # let the configured metadata model inspect all readable documents, including laws.
+    windows = _windows(text, chunks, config) if not damaged and not document.processing["source_partial"] else []
     return document, text, legal, windows
 
 
@@ -121,7 +123,7 @@ def discover_metadata(paths: list[Path], config: PipelineConfig, *, dry_run: boo
                            "chunker": doc.processing["chunker"], "degraded": doc.processing["degraded"],
                            "fallback_reason": doc.processing["fallback_reason"], "warnings": doc.warnings,
                            "estimated_requests": len(windows),
-                           "legal_observations": len(legal["observations"])} for doc, _, legal, windows in prepared],
+                            "legal_structure_spans": len(legal["spans"])} for doc, _, legal, windows in prepared],
             "estimated_requests": sum(len(windows) for _, _, _, windows in prepared), "failed": failed}
     write_json(output / "plan.json", _safe(plan, config))
     if dry_run:
@@ -154,7 +156,9 @@ def discover_metadata(paths: list[Path], config: PipelineConfig, *, dry_run: boo
             progress(f"Metadata: {Path(document.source).name} ({document.processing['route']})")
         # Replace this document's audit rows only; unrelated documents survive incremental runs.
         audits = {key: row for key, row in audits.items() if row["document_id"] != document_id}
-        observations = [(obs, {"method": "regex"}) for obs in legal["observations"]]
+        # Legal syntax is used to recognize documents and preserve their structure,
+        # but content metadata is owned by the open-ended metadata extractor.
+        observations = []
         pending, errors = 0, 0
         for window in windows:
             prompt = metadata_prompt(text, window, context=text[:min(1000, config.metadata_chunk_chars)])
@@ -230,12 +234,6 @@ def discover_metadata(paths: list[Path], config: PipelineConfig, *, dry_run: boo
                              "domain_id": fingerprint(["domain", normalize_label(obs.value)])[:24],
                              "method": obs.method, "confidence": obs.confidence,
                              "evidence": [e.__dict__ for e in obs.evidence]} for obs in domain_obs]
-        if legal["likely"]:
-            supports = next((obs for obs in values if obs.label == "legal_title"), None)
-            if supports:
-                document.domains.append({"value": "law", "original_label": "law", "domain_id": "law",
-                                         "method": "legal_structure", "confidence": 1.0,
-                                         "evidence": [e.__dict__ for e in supports.evidence]})
         if not document.domains:
             document.domains = [{"value": "unknown", "original_label": None, "domain_id": None,
                                  "method": "none", "confidence": None, "reason": "No reliable domain observation."}]
@@ -309,3 +307,46 @@ def metadata_provenance(source_hash: str, config: PipelineConfig) -> dict:
     return {"document_id": record["document_id"], "schema_version": record["metadata_schema_version"],
             "registry_version": record["registry_version"], "status": record["metadata_status"],
             "artifact": str(path), "shadow_mode": True}
+
+
+def export_synthesis_chunks(config: PipelineConfig, sources: list[Path], *, metadata_root: Path | None = None) -> dict:
+    """Export source slices with open-ended metadata, not a hard-coded legal schema."""
+    import uuid
+
+    metadata_dir = (metadata_root or config.stage_output_dir) / "metadata"
+    documents = read_jsonl(metadata_dir / "documents.jsonl")
+    selected = {str(path.resolve()) for path in sources}
+    rows = []
+    for document in documents:
+        if str(Path(document["source"]).resolve()) not in selected:
+            continue
+        raw = Path(document["source"]).read_bytes()
+        source_text = raw.decode("utf-8-sig")
+        if hashlib.sha256(raw).hexdigest() != document["source_sha256"]:
+            continue  # A failed rerun must never export an old version of a changed source.
+        for chunk in document["chunks"]:
+            language = document["language"].get("value", "unknown")
+            discovered = list(document.get("metadata", []))
+            discovered.extend(chunk.get("metadata", []))
+            row = {"text": chunk["text"], "lang": language, "source": Path(document["source"]).name,
+                   "uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, chunk["chunk_id"])),
+                   "metadata": discovered,
+                   "document_type": document.get("document_type", "unknown"),
+                   "provenance": {"source_file": document["processing"].get("original_source") or document["source"],
+                                   "source_sha256": document["processing"].get("original_source_sha256") or document["source_sha256"],
+                                   "cleaned_source_file": document["source"], "cleaned_sha256": document["source_sha256"],
+                                   "document_id": document["document_id"], "unit_id": chunk["chunk_id"],
+                                   "char_start": chunk["start"], "char_end": chunk["end"], "pages": chunk["pages"],
+                                   "discovered_metadata": {"artifact": str(metadata_dir / "documents.jsonl"),
+                                   "status": document["metadata_status"]}},
+                   "article_numbers": chunk.get("normalized_article_numbers", chunk.get("article_numbers", [])),
+                   "level": chunk.get("level", "passage"),
+                   "source_partial": document["processing"].get("source_partial", False),
+                   "source_damaged": document["processing"].get("source_damaged", False),
+                   "chunking": {k: document["processing"].get(k) for k in ("chunker", "degraded", "fallback_reason")}}
+            rows.append(row)
+    output = config.stage_output_dir / "synthesis" / "chunking"
+    write_jsonl(output / "chunks.jsonl", rows)
+    summary = {"chunks": len(rows), "documents": len(selected), "output": str(output / "chunks.jsonl")}
+    write_json(output / "summary.json", summary)
+    return summary

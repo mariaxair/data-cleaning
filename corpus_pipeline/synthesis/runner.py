@@ -36,12 +36,16 @@ def prompt_templates(*, general: bool = False) -> dict[str, Template]:
 
 def generate_unit(unit: SynthesisUnit, config: PipelineConfig, adapter: GenerationAdapter,
                   templates: dict[str, Template], index: int, checkpoint_dir: Path,
-                  run_fingerprint: str) -> dict:
+                  run_fingerprint: str, *, stop_after: str | None = None,
+                  on_phase: Callable | None = None) -> dict:
     """Checkpoint valid phase outputs; retry failed validation without losing earlier phases."""
     identity = fingerprint([unit.id, run_fingerprint, index % len(REASONING_TYPES), index % 2])
     checkpoint = checkpoint_dir / f"{identity}.json"
     previous = load_json(checkpoint)
     responses = previous.get("responses", {})
+    prompts = previous.get("prompts", {})
+    from ..ocr.base import redact_secrets
+    secrets = {config.effective_api_key(), config.ocr_api_key} - {""}
     validations = {}
     tasks = GENERAL_TASKS if unit.tier == "general" else REASONING_TYPES
     fields = {"language": config.synthesis_language, "source": unit.text,
@@ -52,12 +56,18 @@ def generate_unit(unit: SynthesisUnit, config: PipelineConfig, adapter: Generati
         errors = []
         for attempt in range(config.synthesis_max_attempts):
             response = responses.get(phase)
+            prompt = templates[phase].substitute(fields)
             if response is None:
                 # Explanation template has no source placeholder, so raw source is never transmitted.
-                prompt = templates[phase].substitute(fields)
                 if errors:
                     prompt += "\nCorrect validation failures: " + ", ".join(errors)
                 response = adapter.generate(phase, prompt)
+                prompts[phase] = prompt
+            serialized = json.dumps(response, ensure_ascii=False)
+            if redact_secrets(serialized) != serialized or any(secret in serialized for secret in secrets):
+                responses.pop(phase, None)
+                errors = ["Credential-like content in generated response; withheld."]
+                continue
             validation = validate_generation(
                 phase, response, unit, config.synthesis_language,
                 question=fields["question"], answer=fields["answer"])
@@ -67,7 +77,14 @@ def generate_unit(unit: SynthesisUnit, config: PipelineConfig, adapter: Generati
                 validations[phase] = asdict(validation)
                 if phase in fields:
                     fields[phase] = response["text"]
-                write_json(checkpoint, {"responses": responses})
+                saved = {"responses": responses}
+                if on_phase is not None:
+                    saved["prompts"] = prompts
+                write_json(checkpoint, saved)
+                if on_phase is not None:
+                    on_phase(phase, response, prompts.get(phase, prompt), identity)
+                if phase == stop_after:
+                    return {"id": identity, "status": "question_ready", "source_file": unit.source_file}
                 break
             errors = validation.errors
             responses.pop(phase, None)
@@ -226,4 +243,92 @@ def synthesize(paths: list[Path], config: PipelineConfig, *, dry_run: bool = Fal
                        topic_pending_documents=sum(doc["status"] != "discovered" for doc in discovery["documents"]),
                        topic_ungrouped_documents=sum(doc["grouping_status"] != "grouped" for doc in discovery["documents"]))
     write_json(output / "summary.json", summary)
+    return summary
+
+
+def synthesize_chunks(records: list[dict], config: PipelineConfig, *, questions_only: bool = False,
+                      dry_run: bool = False, adapter: GenerationAdapter | None = None,
+                      max_samples: int | None = None, progress: Callable[[str], None] | None = None) -> dict:
+    """Run the question and answer agents on saved chunks, preserving their identities."""
+    from .segmentation import ARTICLE_PATTERN
+    from ..ocr.base import redact_secrets
+    config.validate_training()
+    material = json.dumps(records, ensure_ascii=False)
+    if redact_secrets(material) != material or any(
+            secret and secret in material for secret in (config.effective_api_key(), config.ocr_api_key)):
+        raise ValueError("Source contains a credential; synthesis was withheld.")
+    limit = config.synthesis_max_samples if max_samples is None else max_samples
+    if limit < 1:
+        raise ValueError("Maximum samples must be positive.")
+    selected = [row for row in records if not row.get("source_partial") and not row.get("source_damaged")
+                and len(row.get("text", "").strip()) >= config.min_article_chars][:limit]
+    # Repeated uploads must not race on the same checkpoint file.
+    selected = list({fingerprint(row): row for row in selected}.values())
+    templates = prompt_templates(general=True)
+    legal_templates = prompt_templates()
+    output = config.stage_output_dir / "synthesis"
+    identity = fingerprint({"version": "saved-chunks-1", "model": config.synthesis_model,
+                            "provider": config.ocr_provider, "endpoint": config.ocr_base_url,
+                            "language": config.synthesis_language, "tokens": config.synthesis_max_tokens,
+                            "prompts": [t.template for t in [*templates.values(), *legal_templates.values()]]})
+    plan = {"selected_units": len(selected), "eligible_units": len(selected), "dry_run": dry_run,
+            "excluded": len(records) - len(selected), "questions_only": questions_only,
+            "max_generation_requests": len(selected) * (1 if questions_only else 3) * config.synthesis_max_attempts}
+    write_json(output / "agents-plan.json", plan)
+    if dry_run:
+        return plan
+    adapter = adapter or CompatibleGenerationAdapter(config)
+
+    def run(item: tuple[int, dict]) -> tuple[dict, dict]:
+        index, row = item
+        import uuid
+        row = {"lang": "unknown", **row}
+        row.setdefault("uuid", str(uuid.uuid5(uuid.NAMESPACE_URL, fingerprint(row))))
+        provenance = row.get("provenance", {})
+        # New metadata exports declare structural type explicitly. Preserve the
+        # old JORADP schema as a compatibility path for previously saved chunks.
+        legal = (row.get("document_type") == "structured_legal" or
+                 ("document_type" not in row and bool(row.get("law_number"))))
+        unit = SynthesisUnit(provenance.get("cleaned_source_file", provenance.get("source_file", row["source"])),
+                             provenance.get("cleaned_sha256", provenance.get("source_sha256", "")),
+                             row["text"], "statutory_law" if legal else "general",
+                             "", "",
+                             row.get("article_numbers") or [m["number"] for m in ARTICLE_PATTERN.finditer(row["text"])],
+                             provenance.get("pages", []), char_start=provenance.get("char_start"),
+                             char_end=provenance.get("char_end"))
+        unit.source_document = provenance.get("source_file", "")
+        unit.source_document_sha256 = provenance.get("source_sha256", "")
+        exports = {}
+
+        def on_phase(phase: str, response: dict, prompt: str, record_id: str) -> None:
+            if phase == "question":
+                exports["question"] = {**row, "instruction": response["text"], "prompt_Q": prompt}
+            elif phase == "answer":
+                exports["answer"] = {**exports["question"], "output": response["text"], "prompt_A": prompt}
+
+        try:
+            result = generate_unit(unit, config, adapter, legal_templates if legal else templates,
+                                   index, output / "checkpoints", identity,
+                                   stop_after="question" if questions_only else None, on_phase=on_phase)
+            if result["status"] == "pending_review":
+                result["provenance"].update(provenance)
+                result.update({k: v for k, v in exports["answer"].items() if k != "provenance"})
+            if progress:
+                progress(f"Generated unit {index + 1}/{len(selected)}")
+            return result, exports
+        except Exception:
+            return {"status": "generation_failed", "source": row.get("source"),
+                    "errors": [f"Generation failed for provider {config.ocr_provider}; check settings or retry."]}, exports
+
+    with ThreadPoolExecutor(max_workers=config.synthesis_concurrency, thread_name_prefix="synthesis") as pool:
+        results = list(pool.map(run, enumerate(selected)))
+    write_jsonl(output / "questions" / "questions.jsonl", [exports["question"] for _, exports in results if "question" in exports])
+    if not questions_only:
+        write_jsonl(output / "answers" / "answers.jsonl", [exports["answer"] for _, exports in results if "answer" in exports])
+        write_jsonl(output / "qa.jsonl", [r for r, _ in results if r["status"] == "pending_review"])
+    failures = [r for r, _ in results if r["status"] not in {"question_ready", "pending_review"}]
+    write_jsonl(output / "failed.jsonl", failures)
+    summary = {**plan, "generated": len(results) - len(failures), "failed": len(failures),
+               "provider": config.ocr_provider, "model": config.synthesis_model}
+    write_json(output / ("questions-summary.json" if questions_only else "summary.json"), summary)
     return summary

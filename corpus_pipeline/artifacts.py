@@ -36,3 +36,27 @@ def read_jsonl(path: Path) -> list[dict]:
                 raise ValueError(f"JSONL row {number} must be an object.")
             records.append(value)
     return records
+
+
+def export_corpus(records: list[dict], output: Path) -> dict:
+    """Export accepted QA only, keeping training data separate from its provenance."""
+    accepted, provenance, seen = [], [], set()
+    for record in records:
+        if record.get("status") != "accept" or record.get("pending_checks"):
+            continue
+        question, answer = record.get("question", ""), record.get("answer", "")
+        if not isinstance(question, str) or not question.strip() or not isinstance(answer, str) or not answer.strip():
+            continue
+        identity = fingerprint([question, answer])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        accepted.append({"instruction": question, "input": "", "output": answer})
+        provenance.append({"row": len(accepted), "id": record.get("id"), "uuid": record.get("uuid"),
+                           "provenance": record.get("provenance", {}), "scores": record.get("scores", {})})
+    write_jsonl(output / "corpus.jsonl", accepted)
+    write_jsonl(output / "provenance.jsonl", provenance)
+    summary = {"input_records": len(records), "exported": len(accepted), "excluded": len(records) - len(accepted),
+               "schema": "instruction/input/output", "output": str(output / "corpus.jsonl")}
+    write_json(output / "summary.json", summary)
+    return summary

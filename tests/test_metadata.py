@@ -47,10 +47,7 @@ def test_legal_structure_variants_exact_evidence(heading, number):
     assert result["status"] == "complete"
     assert result["spans"] and "".join(text[s["start"]:s["end"]] for s in result["spans"]) == text
     assert number in [n for s in result["spans"] for n in s["article_numbers"]]
-    for observation in result["observations"]:
-        assert all(text[e.start:e.end] == e.quote for e in observation.evidence)
-    number_obs = next(o for o in result["observations"] if o.label == "legal_instrument_number")
-    assert number_obs.value == "٢٦-٩٠" and number_obs.normalized_value == "26-90"
+    assert "observations" not in result
 
 
 def test_legal_missing_identifier_or_heading_needs_fallback():
@@ -59,11 +56,7 @@ def test_legal_missing_identifier_or_heading_needs_fallback():
     assert not legal_extract("This research discusses article 2 of a law.")["likely"]
 
 
-def test_legal_dates_roles_and_invalid_normalization():
-    text = "قانون رقم 26-90\nالمادة 1 : النص\nحرر بالجزائر في 13 جانفي سنة 2026\nنشر في 2026-02-14"
-    dates = [o for o in legal_extract(text)["observations"] if o.value_type == "date"]
-    assert [o.role for o in dates] == ["signature", "publication"]
-    assert [o.normalized_value for o in dates] == ["2026-01-13", "2026-02-14"]
+def test_date_normalization_helpers():
     assert normalize_date("31 février 2026") is None
     assert normalize_date("03/04/2026") is None
     assert normalize_date("2026-02-30") is None
@@ -92,7 +85,7 @@ def test_semantic_adapter_validation_legal_exclusion_and_dry_run(monkeypatch):
             return [SimpleNamespace(start_index=0, end_index=len(source), text=source, token_count=10)]
 
     chunks, info = chunk_document(text, config, chunker=Fake())
-    assert info["chunker"] == "chonkie_semantic_1.5.2" and chunks[0]["text"] == text
+    assert info["chunker"] == "chonkie_semantic_1.7.0" and chunks[0]["text"] == text
     calls.clear()
     chunks, info = chunk_document(text, config, legal_spans=[{"start": 0, "end": len(text)}], chunker=Fake())
     assert info["chunker"] == "legal_structure" and not calls
@@ -222,8 +215,8 @@ def test_metadata_legal_offline_and_generic_unknown(tmp_path):
     assert result["processed"] == 2 and result["model_calls"] == 0
     docs = read_jsonl(config.stage_output_dir / "metadata/documents.jsonl")
     legal = next(d for d in docs if d["document_type"] == "structured_legal")
-    assert legal["metadata_status"] == "complete"
-    assert legal["domains"][0]["value"] == "law"
+    assert legal["metadata_status"] == "extraction_pending"
+    assert legal["domains"][0]["value"] == "unknown"
     assert legal["processing"]["chunker"] == "legal_structure"
     assert "".join(c["text"] for c in legal["chunks"]) == law.read_bytes().decode("utf-8")
     generic = next(d for d in docs if d["document_type"] != "structured_legal")
@@ -411,7 +404,7 @@ def test_chonkie_pinned_constructor_and_delimiter_policy(monkeypatch):
         return object()
 
     monkeypatch.setitem(sys.modules, "chonkie", SimpleNamespace(SemanticChunker=constructor))
-    monkeypatch.setattr(module, "version", lambda _: "1.5.2")
+    monkeypatch.setattr(module, "version", lambda _: "1.7.0")
     config = PipelineConfig(metadata_embedding_model="FAKE_LOCAL_MODEL")
     module._semantic(config)
     assert seen["skip_window"] == 0 and seen["embedding_model"] == "FAKE_LOCAL_MODEL"
@@ -420,6 +413,121 @@ def test_chonkie_pinned_constructor_and_delimiter_policy(monkeypatch):
     monkeypatch.setattr(module, "version", lambda _: "different")
     with pytest.raises(ValueError, match="version"):
         module._semantic(config)
+
+
+@pytest.mark.parametrize("include_delim", ["prev", "next"])
+def test_installed_chonkie_semantic_api_without_model_download(monkeypatch, include_delim):
+    """Exercise the real optional package; no models, tokenizer files, or network."""
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        installed = version("chonkie")
+    except PackageNotFoundError:
+        pytest.skip("Optional Chonkie is not installed; install requirements-semantic.txt to run the native import check.")
+    assert installed == "1.7.0"
+    # An installed but broken native dependency must fail this test, not silently skip it.
+    from chonkie import SemanticChunker
+    from chonkie.embeddings import AutoEmbeddings, BaseEmbeddings
+    import numpy as np
+    from corpus_pipeline.metadata.chunking import _semantic
+
+    class LocalEmbeddings(BaseEmbeddings):
+        def embed(self, text):
+            return np.array([1.0, 0.5], dtype=np.float32)
+
+        @property
+        def dimension(self):
+            return 2
+
+        def get_tokenizer(self):
+            return "character"
+
+    monkeypatch.setattr(AutoEmbeddings, "get_embeddings", lambda _: LocalEmbeddings())
+    config = PipelineConfig(metadata_embedding_model="FAKE_LOCAL_ONLY", metadata_semantic_enabled=True,
+                            metadata_include_delim=include_delim, metadata_chunk_tokens=100)
+    chunker = _semantic(config)
+    assert isinstance(chunker, SemanticChunker)
+    text = "  Bonjour, un paragraphe français.\r\nهذه فقرة باللغة العربية؟ فقرة ثانية؛\n\n" * 8
+    chunks, info = chunk_document(text, config, chunker=chunker)
+    assert not info["degraded"] and info["chunker"] == "chonkie_semantic_1.7.0"
+    assert len(chunks) > 1 and "".join(c["text"] for c in chunks) == text
+    assert all(text[c["start"]:c["end"]] == c["text"] for c in chunks)
+
+
+@pytest.mark.parametrize("failure", ["missing_package", "native_import", "initialization", "chunk_execution"])
+def test_chonkie_import_and_execution_failures_preserve_source(monkeypatch, failure):
+    import sys
+    from importlib.metadata import PackageNotFoundError
+    import corpus_pipeline.metadata.chunking as module
+    monkeypatch.setattr(module, "version", lambda _: "1.7.0")
+
+    def constructor(**kwargs):
+        raise RuntimeError("Embedding initialization unavailable.")
+
+    class FailingChunker:
+        def chunk(self, source):
+            raise RuntimeError("Chunk execution failed.")
+
+    if failure == "missing_package":
+        def missing(_):
+            raise PackageNotFoundError("chonkie")
+        monkeypatch.setattr(module, "version", missing)
+    elif failure == "native_import":
+        monkeypatch.setitem(sys.modules, "chonkie", None)
+    elif failure == "initialization":
+        monkeypatch.setitem(sys.modules, "chonkie", SimpleNamespace(SemanticChunker=constructor))
+    else:
+        monkeypatch.setitem(sys.modules, "chonkie", SimpleNamespace(SemanticChunker=lambda **_: FailingChunker()))
+    text = "  العربية؟\r\n\nTexte français؛ " * 8
+    config = PipelineConfig(metadata_semantic_enabled=True, metadata_embedding_model="FAKE_LOCAL_MODEL")
+    chunks, info = chunk_document(text, config)
+    assert info["chunker"] == "paragraph_recursive" and info["degraded"]
+    assert info["fallback_reason"] and info["reconstruction_exact"]
+    assert "".join(c["text"] for c in chunks) == text
+    assert all(text[c["start"]:c["end"]] == c["text"] for c in chunks)
+
+
+@pytest.mark.parametrize("defect", ["gap", "overlap", "text", "truncation", "tokens", "negative_tokens", "size"])
+def test_chonkie_invalid_chunks_fall_back_with_exact_reconstruction(defect):
+    text = "Bonjour.\r\nالعربية؟\n\nSuite du document."
+
+    class InvalidChunks:
+        def chunk(self, source):
+            middle = len(source) // 2
+            first = SimpleNamespace(start_index=0, end_index=middle, text=source[:middle], token_count=10)
+            second = SimpleNamespace(start_index=middle, end_index=len(source), text=source[middle:], token_count=10)
+            if defect in {"gap", "overlap"}:
+                second.start_index += 1 if defect == "gap" else -1
+            elif defect == "text":
+                second.text = second.text.strip()
+                first.text = "rewritten source"
+            elif defect == "truncation":
+                return [first]
+            elif defect == "tokens":
+                first.token_count = 10000
+            elif defect == "negative_tokens":
+                first.token_count = -1
+            return [first, second]
+
+    config = PipelineConfig(metadata_semantic_enabled=True, metadata_chunk_chars=10 if defect == "size" else 6000)
+    chunks, info = chunk_document(text, config, chunker=InvalidChunks())
+    assert info["degraded"] and info["chunker"] == "paragraph_recursive"
+    assert "".join(c["text"] for c in chunks) == text
+    assert all(text[c["start"]:c["end"]] == c["text"] for c in chunks)
+
+
+def test_semantic_multichunk_offsets_exact_in_unicode_characters():
+    text = "  العربية؟\r\nTexte français؛\n\nDernière phrase.  "
+    bounds = [0, text.index("Texte"), text.index("Dernière"), len(text)]
+
+    class ExactChunks:
+        def chunk(self, source):
+            return [SimpleNamespace(start_index=a, end_index=b, text=source[a:b], token_count=b-a)
+                    for a, b in zip(bounds, bounds[1:])]
+
+    chunks, info = chunk_document(text, PipelineConfig(metadata_semantic_enabled=True), chunker=ExactChunks())
+    assert not info["degraded"] and info["chunker"] == "chonkie_semantic_1.7.0"
+    assert [(c["start"], c["end"]) for c in chunks] == list(zip(bounds, bounds[1:]))
+    assert "".join(c["text"] for c in chunks) == text
 
 
 def test_metadata_failure_envelope_recovers_and_cache_corruption_regenerates(tmp_path):
@@ -442,8 +550,8 @@ def test_metadata_failure_envelope_recovers_and_cache_corruption_regenerates(tmp
 
 def test_legal_invalid_calendar_value_is_audited_and_missing_article_detected():
     result = legal_extract("قانون رقم 26-90\nالمادة 1 : نص\nحرر في 2026-02-30")
-    invalid = [obs for obs in result["observations"] if obs.value_type == "date"]
-    assert invalid and invalid[0].status == "rejected"
+    assert result["status"] == "complete"
+    assert "observations" not in result
     result = legal_extract("قانون رقم 26-90\nالمادة 1 : نص\n## المادة غير واضحة\nباقي النص")
     assert result["status"] == "needs_fallback"
 
@@ -495,3 +603,186 @@ def test_metadata_evaluation_cli_missing_predictions_do_not_score_as_exact(tmp_p
     evaluation = load_json(output / "metadata/evaluation.json")
     assert evaluation["exact_document_rate"] == 0
     assert evaluation["source_reconstruction_rate"] == 0
+def test_synthesis_chunks_use_open_metadata_instead_of_hardcoded_legal_columns(tmp_path):
+    import json
+    import re
+    from config import PipelineConfig
+    from corpus_pipeline.artifacts import read_jsonl
+    from corpus_pipeline.metadata.runner import discover_metadata, export_synthesis_chunks
+    source = tmp_path / "two-laws.txt"
+    source.write_text("law n° 10-01\nArticle 1 First provision with enough substantive content.\n"
+                      "law n° 20-02\nArticle 1 Second provision with enough substantive content.\n", encoding="utf-8")
+    config = PipelineConfig(stage_output_dir=tmp_path / "data")
+
+    class ExtractLegalFields:
+        def generate(self, phase, prompt):
+            start = int(re.search(r"absolute starting offset (\d+)", prompt).group(1))
+            source_match = re.search(r"SOURCE \(JSON string.*?\):\n(.*)\Z", prompt, re.S)
+            excerpt = json.loads(source_match.group(1))
+            observations = []
+            for match in re.finditer(r"law n° (\d+-\d+)", excerpt):
+                quote = match.group()
+                observations.extend([
+                    {"label": "legal identifier", "value": match.group(1), "value_type": "string",
+                     "scope": "document", "confidence": 0.99, "evidence": [{"quote": quote,
+                     "start": start + match.start(), "end": start + match.end()}]},
+                    {"label": "legal instrument type", "value": "law", "value_type": "string",
+                     "scope": "document", "confidence": 0.99, "evidence": [{"quote": "law",
+                     "start": start + match.start(), "end": start + match.start() + 3}]},
+                ])
+            return {"observations": observations}
+
+    discover_metadata([source], config, adapter=ExtractLegalFields())
+    export_synthesis_chunks(config, [source])
+    rows = read_jsonl(config.stage_output_dir / "synthesis/chunking/chunks.jsonl")
+    assert "".join(row["text"] for row in rows) == source.read_bytes().decode("utf-8")
+    assert all("law_number" not in row and "law_type" not in row for row in rows)
+    assert all(row["document_type"] == "structured_legal" for row in rows)
+    for row in rows:
+        assert isinstance(row["text"], str) and isinstance(row["lang"], str)
+        assert isinstance(row["source"], str) and isinstance(row["uuid"], str)
+        assert {item["value"] for item in row["metadata"] if item["label"] == "legal identifier"} == {"10-01", "20-02"}
+        assert {item["value"] for item in row["metadata"] if item["label"] == "legal instrument type"} == {"law"}
+
+
+def test_chunk_quality_benchmark_uses_judge_and_flags_bad_integrity(tmp_path):
+    from corpus_pipeline.benchmark import evaluate_chunk_quality
+    from corpus_pipeline.artifacts import write_jsonl
+
+    source = tmp_path / "source.txt"
+    text = "A coherent first sentence.\nA second supporting sentence.\n"
+    source.write_text(text, encoding="utf-8")
+    chunks = tmp_path / "chunks.jsonl"
+    write_jsonl(chunks, [
+        {"text": text, "source": source.name, "uuid": "ok", "provenance": {
+            "document_id": "doc", "unit_id": "ok", "cleaned_source_file": str(source),
+            "char_start": 0, "char_end": len(text)}},
+        {"text": "broken", "source": source.name, "uuid": "bad", "provenance": {
+            "document_id": "doc", "unit_id": "bad", "cleaned_source_file": str(source),
+            "char_start": 0, "char_end": 6}},
+    ])
+
+    class Judge:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, phase, prompt):
+            self.calls.append((phase, prompt))
+            return {"coherence": 4, "completeness": 5, "standalone": 4,
+                    "issues": [], "rationale": "Complete and coherent."}
+
+    judge = Judge()
+    output = tmp_path / "evaluation.json"
+    report = evaluate_chunk_quality(chunks, output, adapter=judge, min_chunk_chars=10)
+    assert report["chunks"] == report["judged_chunks"] == 2
+    assert report["mean_scores"]["mean_score"] == pytest.approx(round(13 / 3, 2))
+    assert report["source_reconstruction_failures"] == 1
+    assert report["flagged_chunks"] == 1
+    bad_chunk = next(row for row in report["results"] if row["chunk_id"] == "bad")
+    assert "source_offset_mismatch" in bad_chunk["issues"]
+    assert all(phase == "chunk_judge" for phase, _ in judge.calls)
+    assert load_json(output)["judge_calls"] == 2
+
+
+def test_chunk_quality_benchmark_judge_is_opt_in_and_call_bounded(tmp_path):
+    from corpus_pipeline.benchmark import evaluate_chunk_quality
+    from corpus_pipeline.artifacts import write_jsonl
+
+    chunks = tmp_path / "chunks.jsonl"
+    write_jsonl(chunks, [{"text": "A complete passage."}, {"text": "Another passage."}])
+
+    class Judge:
+        calls = 0
+
+        def generate(self, phase, prompt):
+            self.calls += 1
+            return {"coherence": 3, "completeness": 3, "standalone": 3,
+                    "issues": [], "rationale": "Acceptable."}
+
+    judge = Judge()
+    report = evaluate_chunk_quality(chunks, tmp_path / "evaluation.json", adapter=judge, max_calls=1)
+    assert judge.calls == report["judge_calls"] == report["judged_chunks"] == 1
+    assert report["results"][1]["judge_error"] == "judge_call_budget_exhausted"
+
+    with pytest.raises(ValueError, match="explicit judge model"):
+        evaluate_chunk_quality(chunks, tmp_path / "offline.json")
+
+
+def test_metadata_quality_benchmark_checks_evidence_and_judges_bounded_records(tmp_path):
+    from corpus_pipeline.benchmark import evaluate_metadata_quality
+    from corpus_pipeline.artifacts import write_jsonl
+
+    source = tmp_path / "doc.txt"
+    source.write_text("Name: Example University\n", encoding="utf-8")
+    rows = tmp_path / "documents.jsonl"
+    write_jsonl(rows, [{"document_id": "doc-1", "source": str(source), "document_type": "unknown",
+                        "metadata_status": "complete", "metadata": [{"label": "organization",
+                        "value": "Example University", "evidence": [{"quote": "Example University",
+                        "start": 6, "end": 24}]}], "chunks": []},
+                       {"document_id": "doc-2", "source": str(source), "metadata": [{"label": "date",
+                        "value": "2024-01-01", "evidence": [{"quote": "fabricated", "start": 6, "end": 16}]}],
+                        "chunks": []}])
+
+    class Judge:
+        calls = 0
+
+        def generate(self, phase, prompt):
+            self.calls += 1
+            assert phase == "metadata_judge"
+            return {"evidence_grounding": 4, "label_value_fit": 4, "useful_specificity": 3,
+                    "issues": [], "rationale": "Mostly supported."}
+
+    judge = Judge()
+    report = evaluate_metadata_quality(rows, tmp_path / "metadata-evaluation.json", adapter=judge, max_calls=1)
+    assert report["judge_calls"] == judge.calls == report["judged_records"] == 1
+    assert report["results"][1]["judge_error"] == "not_sampled_by_budget"
+    assert "metadata_evidence_mismatch" in report["results"][1]["issues"]
+    assert load_json(tmp_path / "metadata-evaluation.json")["target"] == "metadata"
+
+
+def test_qa_and_review_quality_judges_receive_source_and_bounded_calls(tmp_path):
+    from corpus_pipeline.benchmark import evaluate_qa_quality, evaluate_review_quality
+    from corpus_pipeline.artifacts import write_jsonl
+
+    source = tmp_path / "source.txt"
+    source.write_text("A source passage that supports the generated answer.", encoding="utf-8")
+    record = {"id": "qa-1", "question": "What does the passage support?", "answer": "It supports the answer.",
+              "reasoning_chain": "The answer follows from the passage.", "source_text": source.read_text(),
+              "scores": {"corpus_accuracy": 2}, "review": {"decision": "accept", "history": []},
+              "status": "accept", "pending_checks": []}
+    qa_path = tmp_path / "qa.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    write_jsonl(qa_path, [record])
+    write_jsonl(audit_path, [record])
+
+    class Judge:
+        def __init__(self, phase, dimensions):
+            self.phase, self.dimensions, self.calls = phase, dimensions, 0
+
+        def generate(self, phase, prompt):
+            self.calls += 1
+            assert phase == self.phase and "source passage" in prompt
+            return {**{dimension: 4 for dimension in self.dimensions}, "issues": [], "rationale": "Supported."}
+
+    qa_dims = ("question_quality", "answer_grounding", "answer_completeness", "self_containedness")
+    qa_judge = Judge("qa_judge", qa_dims)
+    qa_report = evaluate_qa_quality(qa_path, tmp_path / "qa-evaluation.json", adapter=qa_judge)
+    assert qa_report["judged_records"] == qa_judge.calls == 1
+    review_dims = ("decision_consistency", "rationale_quality", "issue_detection")
+    review_judge = Judge("review_judge", review_dims)
+    review_report = evaluate_review_quality(audit_path, tmp_path / "review-evaluation.json", adapter=review_judge)
+    assert review_report["judged_records"] == review_judge.calls == 1
+
+
+def test_quality_evaluation_cli_writes_separate_report_offline_with_judging_disabled(tmp_path, monkeypatch):
+    import sys
+    import cli
+    source = tmp_path / "source.txt"
+    source.write_text("Supported source.", encoding="utf-8")
+    qa = tmp_path / "qa.jsonl"
+    write_jsonl(qa, [{"question": "Q?", "answer": "A.", "source_text": "Supported source."}])
+    output = tmp_path / "output"
+    monkeypatch.setattr("sys.argv", ["cli.py", "--qa-quality-evaluate", str(qa),
+                                      "--quality-judge-max-calls", "0", "--stage-output", str(output)])
+    assert cli.main() == 0
+    assert load_json(output / "evaluation/qa-quality.json")["judge_calls"] == 0

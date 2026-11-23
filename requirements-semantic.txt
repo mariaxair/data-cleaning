@@ -1,4 +1,4 @@
 # Optional metadata semantic chunking only. No runtime auto-installation.
-# v1.5.2 public API checked; actual embeddings still require corpus evaluation.
+# v1.7.0 public API checked; native dependencies must support the active Python.
 -r requirements.txt
-chonkie[semantic]==1.5.2
+chonkie[semantic]==1.7.0

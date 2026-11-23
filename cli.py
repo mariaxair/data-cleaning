@@ -26,6 +26,17 @@ def main() -> int:
     parser.add_argument("--metadata-max-calls", type=int, help="Metadata model-call budget")
     parser.add_argument("--with-metadata", action="store_true", help="Attach existing metadata references to QA provenance")
     parser.add_argument("--metadata-evaluate", type=Path, help="Evaluate metadata against annotated reference JSONL")
+    parser.add_argument("--chunk-evaluate", type=Path, help="Evaluate saved chunk JSONL with deterministic checks and an optional LLM judge")
+    parser.add_argument("--chunk-judge-model", "--quality-judge-model", dest="chunk_judge_model",
+                        help="Explicit text model for quality judging (defaults to SYNTHESIS_MODEL)")
+    parser.add_argument("--chunk-judge-max-calls", "--quality-judge-max-calls", dest="chunk_judge_max_calls",
+                        type=int, default=100, help="Maximum LLM judge calls per evaluation (0 disables judging)")
+    parser.add_argument("--metadata-quality-evaluate", type=Path,
+                        help="Judge saved metadata observations and evidence in a documents.jsonl")
+    parser.add_argument("--qa-quality-evaluate", type=Path,
+                        help="Judge generated question/answer records against their source")
+    parser.add_argument("--review-quality-evaluate", type=Path,
+                        help="Independently judge review audit records against their source and QA")
     parser.add_argument("--screening-mode", choices=["legal", "automatic"],
                         help="Legacy legal screening or model-discovered themes in any domain")
     parser.add_argument("--discover-topics", action="store_true",
@@ -46,6 +57,10 @@ def main() -> int:
     parser.add_argument("--compare-benchmarks", action="store_true",
                         help="Compare saved benchmark history and exit")
     args = parser.parse_args()
+    evaluation_targets = [args.chunk_evaluate, args.metadata_evaluate, args.metadata_quality_evaluate,
+                          args.qa_quality_evaluate, args.review_quality_evaluate]
+    if sum(value is not None for value in evaluation_targets) > 1:
+        parser.error("Select one evaluation target per invocation; each target writes its own report.")
     logger = configure_logging(LOG_LEVEL)
     config = PipelineConfig()
     if args.metadata_llm:
@@ -88,6 +103,38 @@ def main() -> int:
             parser.error("Metadata evaluation requires valid documents and annotated reference JSONL.")
         logger.info("metadata evaluation " + json.dumps(result))
         return 0
+    if args.chunk_evaluate:
+        from corpus_pipeline.benchmark import evaluate_chunk_quality
+        judge_model = args.chunk_judge_model if args.chunk_judge_model is not None else config.synthesis_model
+        try:
+            result = evaluate_chunk_quality(
+                args.chunk_evaluate, config.stage_output_dir / "synthesis" / "chunking" / "evaluation.json",
+                config=config, judge_model=judge_model, max_calls=args.chunk_judge_max_calls)
+        except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+            parser.error("Chunk evaluation failed; provide a valid chunk JSONL, compatible provider credentials, and an explicit judge model.")
+        logger.info("chunk evaluation " + json.dumps({key: value for key, value in result.items() if key != "results"}))
+        return 0
+    quality_requests = [("metadata", args.metadata_quality_evaluate), ("qa", args.qa_quality_evaluate),
+                        ("review", args.review_quality_evaluate)]
+    selected_quality = [(target, path) for target, path in quality_requests if path]
+    if selected_quality:
+        if len(selected_quality) != 1:
+            parser.error("Select one quality evaluation target per invocation.")
+        from corpus_pipeline import benchmark
+        target, input_path = selected_quality[0]
+        evaluator = {"metadata": benchmark.evaluate_metadata_quality,
+                     "qa": benchmark.evaluate_qa_quality,
+                     "review": benchmark.evaluate_review_quality}[target]
+        output = config.stage_output_dir / "evaluation" / f"{target}-quality.json"
+        judge_model = args.chunk_judge_model if args.chunk_judge_model is not None else config.synthesis_model
+        try:
+            result = evaluator(input_path, output, config=config, judge_model=judge_model,
+                               max_calls=args.chunk_judge_max_calls)
+        except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+            parser.error(f"{target.title()} quality evaluation failed; provide valid input and configured provider credentials/model.")
+        logger.info(f"{target} quality evaluation " + json.dumps(
+            {key: value for key, value in result.items() if key != "results"}))
+        return 0
     if args.compare_benchmarks:
         from corpus_pipeline.artifacts import write_json
         from corpus_pipeline.benchmark import load_comparison, write_comparison
@@ -122,6 +169,9 @@ def main() -> int:
         parser.error("Metadata does not use the OCR connection test; use --metadata --dry-run to inspect its plan.")
     if args.llm_review and stage != "review":
         parser.error("--llm-review requires --review.")
+    if (args.chunk_judge_model is not None or args.chunk_judge_max_calls != 100) and not (
+            args.chunk_evaluate or selected_quality):
+        parser.error("Judge settings require a chunk or quality evaluation target.")
     paths = [Path(path) for path in args.paths]
     folder = args.folder or (INPUT_DIR if not paths else None)
     if folder:

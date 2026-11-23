@@ -182,3 +182,102 @@ def test_generation_errors_never_serialize_adapter_exception(tmp_path):
     assert result["failed"] == 1
     assert "opaque-credential-must-not-leak" not in (
         config.stage_output_dir / "synthesis/failed.jsonl").read_text(encoding="utf-8")
+
+
+def saved_chunk():
+    return {"text": SOURCE, "source": "law.txt", "law_number": "99-10", "law_type": "law", "year": "",
+            "lang": "ar", "uuid": "stable-chunk", "provenance": {"source_file": "original.pdf",
+            "source_sha256": "original", "cleaned_source_file": "cleaned.txt", "cleaned_sha256": "cleaned",
+            "unit_id": "chunk-id", "char_start": 0, "char_end": len(SOURCE), "law_title": "قانون الاختبار"}}
+
+
+def test_saved_chunks_question_then_answer_resume_and_joradp_schema(tmp_path):
+    from pathlib import Path
+    from corpus_pipeline.synthesis.runner import synthesize_chunks
+    from corpus_pipeline.artifacts import read_jsonl
+    config = PipelineConfig(stage_output_dir=tmp_path)
+    fake = FakeGeneration()
+    first = synthesize_chunks([saved_chunk()], config, questions_only=True, adapter=fake)
+    assert first["generated"] == 1 and [phase for phase, _ in fake.calls] == ["question"]
+    question = read_jsonl(tmp_path / "synthesis/questions/questions.jsonl")[0]
+    assert question["instruction"] == fake.generate("question", "")["text"]
+    fake.calls.pop()  # Ignore the direct fixture lookup above.
+    assert synthesize_chunks([saved_chunk()], config, adapter=fake)["generated"] == 1
+    assert [phase for phase, _ in fake.calls] == ["question", "answer", "explanation"]
+    answer = read_jsonl(tmp_path / "synthesis/answers/answers.jsonl")[0]
+    assert answer["uuid"] == question["uuid"] == "stable-chunk"
+    assert answer["instruction"] in answer["prompt_A"] and SOURCE in answer["prompt_Q"]
+    examples = Path("data_processing_examples/joradp")
+    for directory, record in (("合成Q", question), ("合成A", answer)):
+        example = read_jsonl(next((examples / directory).glob("*.jsonl")))[0]
+        assert set(example) <= set(record)
+        assert all(type(record[key]) is type(value) for key, value in example.items())
+    qa = read_jsonl(tmp_path / "synthesis/qa.jsonl")[0]
+    assert qa["provenance"]["source_file"] == "original.pdf"
+    assert qa["provenance"]["unit_id"] == "chunk-id"
+    assert qa["question"] == answer["instruction"] and qa["answer"] == answer["output"]
+
+
+def test_saved_chunks_exclude_partial_sources_and_apply_cap(tmp_path):
+    from corpus_pipeline.synthesis.runner import synthesize_chunks
+    fake = FakeGeneration()
+    rows = [{**saved_chunk(), "source_partial": True}, saved_chunk(), saved_chunk()]
+    result = synthesize_chunks(rows, PipelineConfig(stage_output_dir=tmp_path), adapter=fake, max_samples=1)
+    assert result["generated"] == 1 and result["excluded"] == 2
+    assert len(fake.calls) == 3
+
+
+def test_saved_chunks_keep_valid_questions_on_answer_failure(tmp_path):
+    from corpus_pipeline.synthesis.runner import synthesize_chunks
+    from corpus_pipeline.artifacts import read_jsonl
+    class BrokenAnswer(FakeGeneration):
+        def generate(self, phase, prompt):
+            if phase == "answer":
+                raise RuntimeError("secret-not-for-artifacts")
+            return super().generate(phase, prompt)
+    config = PipelineConfig(stage_output_dir=tmp_path)
+    assert synthesize_chunks([saved_chunk()], config, adapter=BrokenAnswer())["failed"] == 1
+    assert len(read_jsonl(tmp_path / "synthesis/questions/questions.jsonl")) == 1
+    assert read_jsonl(tmp_path / "synthesis/qa.jsonl") == []
+    resumed = FakeGeneration()
+    assert synthesize_chunks([saved_chunk()], config, adapter=resumed)["generated"] == 1
+    assert [phase for phase, _ in resumed.calls] == ["answer", "explanation"]
+    assert "secret-not-for-artifacts" not in (tmp_path / "synthesis/failed.jsonl").read_text()
+
+
+def test_saved_chunk_generation_rejects_credentials_before_export(tmp_path):
+    from corpus_pipeline.synthesis.runner import synthesize_chunks
+    class Unsafe(FakeGeneration):
+        def generate(self, phase, prompt):
+            response = super().generate(phase, prompt)
+            response["text"] += " opaque-test-credential"
+            return response
+    config = PipelineConfig(stage_output_dir=tmp_path, ocr_api_key="opaque-test-credential")
+    result = synthesize_chunks([saved_chunk()], config, adapter=Unsafe())
+    assert result["failed"] == 1
+    for path in tmp_path.rglob("*.json*"):
+        assert "opaque-test-credential" not in path.read_text(encoding="utf-8")
+
+
+def test_saved_qa_governance_review_and_final_corpus_offline(tmp_path):
+    from corpus_pipeline.synthesis.runner import synthesize_chunks
+    from corpus_pipeline.artifacts import read_jsonl, export_corpus
+    from corpus_pipeline.governance.runner import process_corpus
+    from corpus_pipeline.governance.dialect import DialectPrediction
+    from corpus_pipeline.review.runner import review_corpus
+    from corpus_pipeline.review.checks import LLM_DIMENSIONS
+    class Classifier:
+        def classify(self, text):
+            return DialectPrediction({"MSA": 1.0, "Algerian": 0.0, "Moroccan": 0.0}, "fake", False, True)
+    class Reviewer:
+        def review(self, record):
+            return dict.fromkeys(LLM_DIMENSIONS, 2)
+    config = PipelineConfig(stage_output_dir=tmp_path)
+    assert synthesize_chunks([saved_chunk()], config, adapter=FakeGeneration())["generated"] == 1
+    qa = read_jsonl(tmp_path / "synthesis/qa.jsonl")
+    assert process_corpus(qa, config, classifier=Classifier())["pass"] == 1
+    passed = read_jsonl(tmp_path / "governance/pass.jsonl")
+    assert review_corpus(passed, config, classifier=Classifier(), reviewer=Reviewer())["accept"] == 1
+    accepted = read_jsonl(tmp_path / "review/accepted.jsonl")
+    assert export_corpus(accepted, tmp_path / "corpus")["exported"] == 1
+    assert read_jsonl(tmp_path / "corpus/corpus.jsonl")[0]["output"] == qa[0]["answer"]

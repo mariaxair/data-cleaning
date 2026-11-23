@@ -104,6 +104,10 @@ def review_record(record: dict, config: PipelineConfig, classifier: DialectClass
                          "history": history, "degraded": result.degraded,
                          "skipped_dimensions": result.skipped}
     current["status"] = decision
+    if "instruction" in current:
+        # Keep the JORADP export aliases consistent after targeted repairs.
+        current["instruction"] = current["question"]
+        current["output"] = current["answer"]
     if decision == "accept":
         current["pending_checks"] = []
     return current

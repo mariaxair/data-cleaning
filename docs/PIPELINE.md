@@ -1,11 +1,146 @@
 # Corpus pipeline engineering guide
 
+## GUI workflow: six ordered stages
+
+The GUI uses exactly **OCR, Cleaning, Synthesis, Governance, Review, Corpus**, in that order.
+Its shared root defaults to `data`, independently of the legacy CLI's `data/ocr-out` and
+`data/training` defaults. Existing outputs are not relocated. The root control updates the
+suggested inputs for the following tabs; explicit uploads take precedence. Each stage runs
+only when its button is clicked. OCR benchmarking is a collapsed panel inside OCR.
+
+```text
+data/
+  in/                         raw inputs (user supplied)
+  ocr/                        raw extracted TXT, page report JSON, optional metrics
+  cleaning/                   cleaned TXT, source report JSON, rules-report.json, summary.json
+  synthesis/
+    chunking/                 chunks.jsonl, summary.json
+    metadata/                 documents/observations JSONL, registry, review queue, model cache
+    questions/                questions.jsonl
+    answers/                  answers.jsonl
+    checkpoints/              validated question/answer/public-explanation phases and prompts
+    qa.jsonl                  internal QA + JORADP aliases for Governance
+    failed.jsonl              generation/validation failures
+    agents-plan.json          agent budget and eligible counts
+    topics.json               optional document themes/groups
+  governance/                 pass/manual/intercept/duplicates JSONL + summary
+  review/                     audit/accepted/rejected/manual JSONL + summary
+  corpus/                     corpus.jsonl, provenance.jsonl, summary.json
+  pipeline.sqlite3            shared OCR cache and completion manifest (configurable)
+  benchmarks/                 benchmark history/comparison (configurable)
+```
+
+```mermaid
+flowchart LR
+    Raw[Raw files] --> OCR[1 OCR: raw TXT and page report]
+    OCR --> Clean[2 Cleaning: format and deterministic corrections]
+    Clean --> Chunk[3.1 Exact chunks]
+    Chunk --> Meta[3.2 Metadata and provenance]
+    Meta --> Q[3.3 Question agent]
+    Q --> A[3.4 Answer agent and public explanation]
+    A --> Gov[4 Governance]
+    Gov --> Review[5 Review and repair]
+    Review -->|accept only| Corpus[6 Corpus: instruction/input/output]
+    Review -->|manual or reject| Audit[Review audit buckets]
+```
+
+ASCII: `raw -> OCR -> Cleaning -> [chunks -> metadata -> Q -> A] -> Governance -> Review -> accepted Corpus`.
+
+**Run:** `.\.venv\Scripts\python.exe app.py`. In OCR, select inputs and run extraction. This tab
+calls the existing processor with `apply_cleaning=False`; default library/CLI calls still clean
+as before and retain their TXT bytes. The new mode participates in the manifest fingerprint;
+the page OCR cache and concurrency design are unchanged. The OCR report includes original page
+texts and marker settings so Cleaning can operate per page without duplicating markers.
+Cleaning retains failed-page flags/original-source provenance, writes per-page and aggregate hit
+counts, and skips matching input/report/rule fingerprints unless forced. Format cleaning can be
+disabled independently of deterministic semantic corrections. Corrections never call a model.
+
+In Synthesis, select cleaned TXT/MD. **1. Chunk text** uses the existing metadata preparer with
+metadata model calls disabled; cheap deterministic legal observations may also be written.
+**2. Extract metadata** uses the same source slices and can call the configured metadata model
+only when enabled. Disable metadata dry run to write chunks; dry run only writes a plan. Legal
+structure takes priority; generic text uses optional Chonkie or an explicitly degraded recursive
+fallback. Source offsets refer to the decoded original text, including Windows CRLF characters.
+Chunk concatenation exactly reconstructs that text. Unknown metadata is never invented.
+
+**3. Generate questions** consumes the saved `chunking/chunks.jsonl`, validates each question and
+checkpoints it. **4. Generate answers** consumes the same chunks, revalidates/reuses question
+checkpoints, then generates grounded answers and the existing public explanation. It can also run
+from scratch if questions are missing. Disable agent dry run and configure a text model/key for
+live execution. The max-unit guard, bounded synthesis pool, HTTP retries, validation attempts and
+phase caches are reused. Changes to source, provider, endpoint, model, language, token limit or
+prompts invalidate the corresponding identity. Changes to metadata references refresh exports
+without invalidating unchanged generation text. Partial/damaged sources are excluded. Optional
+theme discovery remains available separately; it does not block generation from saved chunks.
+
+The exported contracts follow the examples in `data_processing_examples/joradp`:
+
+| Artifact | Example-compatible fields | Additional audit fields |
+| --- | --- | --- |
+| chunks | `text, law_number, law_type, year, lang, source` | stable `uuid`, exact offsets/pages/hashes, metadata reference, chunker/degraded flags |
+| questions | chunk fields + `uuid, instruction, prompt_Q` | same provenance |
+| answers | question fields + `output, prompt_A` | same provenance |
+| internal QA | aliases `instruction=question`, `output=answer` | validated evidence, public explanation, language, pending checks, scores |
+| review | QA envelope with synchronized question/answer aliases after repair | structured dimension scores and repair audit; example typo `socre` is not copied |
+| training corpus | `instruction, input, output` | provenance/scores in a separate row-indexed JSONL |
+
+The schema matches the example field names/types; extra traceability fields are intentional.
+General-domain records retain empty legal identifiers and `unknown` language where identification
+is uncertain. A chunk spanning multiple legal instruments has empty ambiguous law identifiers.
+Legal metadata comes from local explicit headings, not a guessed document-wide number. These are
+source slices, not a claim to reproduce the examples' exact manual decree boundaries.
+
+Governance consumes `synthesis/qa.jsonl`; Review defaults to `governance/pass.jsonl`. A user can
+upload manual candidates for review explicitly. Existing degraded dialect checks and skipped
+semantic dimensions still route to manual, never automatic acceptance. Corpus only exports records
+with status `accept`, no pending checks, and nonempty question/answer; duplicate QA are collapsed.
+Training rows omit raw source, model prompts and public explanation. This is a deterministic
+export, with no API calls. An empty corpus can correctly mean no samples have passed Review.
+
+Implementation extends existing files: `processor.py` adds the optional raw extraction hook;
+`cleaning.py::clean_files` handles standalone cleaning; `metadata/runner.py::export_synthesis_chunks`
+creates the JORADP chunk envelope; `synthesis/runner.py::synthesize_chunks` reuses `generate_unit`
+for separate agents; `review/runner.py` synchronizes repaired aliases; `artifacts.py::export_corpus`
+filters training rows; `app.py` wires the six tabs. No new config framework, provider adapter,
+environment or model dependency was added. CLI workflows described below remain supported;
+their output roots differ from the new GUI defaults as documented above.
+
 ## Metadata discovery (shadow stage)
+
+### Session controls in the GUI
+
+All operational runtime settings are exposed through existing Gradio tabs and collapsed panels.
+`METADATA_SEMANTIC_ENABLED` is **Use Chonkie semantic chunking**; `METADATA_EMBEDDING_MODEL` is an
+editable preset dropdown accepting model IDs or a local directory. Disabled semantic mode disables
+that selector without erasing its value. Dry run never initializes embeddings. The selector does
+not install packages or download models just by changing a choice; explicit non-dry execution may
+load the chosen model. Existing optional-dependency limitations and fallback behavior still apply.
+
+Checkboxes handle boolean switches, dropdowns handle finite choices, numeric controls handle budgets/
+thresholds, and text fields handle paths and custom model IDs. Advanced controls use a compact
+stage-settings table in `app.py`; there is no new configuration framework or persisted UI settings.
+`_apply_stage_settings` validates/converts values into a fresh `PipelineConfig` per run, leaving process
+environment/config files untouched. Invalid numeric inputs fail before any partial override is applied.
+
+One GUI output root serves all six stages. One benchmark folder pair serves extraction/comparison;
+one dialect group serves governance/review; one HTTP timeout/retry group serves text-generation
+calls across synthesis/metadata/review. OCR keeps independent timeouts/retries. Source/cleaned output,
+cache path, markers/template, languages, rules, routing thresholds, DPI, concurrency, benchmark settings,
+synthesis/metadata budgets and segmentation, classifier data/thresholds, review repair limits and
+evaluation thresholds are all configurable through their corresponding controls. Metadata evaluation
+thresholds appear only in the evaluation panel. Local MARBERT uses the backend value `marbert`.
+
+Stage buttons replace redundant CLI stage-enable toggles; environment auto-stage flags do not launch
+anything in the GUI. The session key override is handled by the masked provider field. Skip-window
+merging stays fixed at 0, explicitly shown in Metadata: source order is an invariant, not an optional
+feature. `--force` and connection testing have OCR controls; aggregated rule counters are exported by Cleaning.
+Report filename flags are represented by artifact downloads, including routing/cleaning reports and
+benchmark/evaluation reports. Log-level/startup constants are application settings, not document-
+processing controls. No core pipeline stage/configuration schema was removed or renamed.
 
 This opt-in stage implements [the metadata plan](METADATA_DISCOVERY_PLAN.md). It consumes
 cleaned TXT/MD and an optional adjacent `.report.json`. It does not modify legacy OCR, QA,
-governance, review, or benchmark outputs. All metadata flags default off. The dedicated GUI
-tab shares the existing provider/key controls and has a separate explicit metadata model.
+governance, review, or benchmark outputs. All metadata flags default off. The Synthesis tab contains metadata controls and shares text-provider settings, with a separate explicit metadata model.
 
 ```mermaid
 flowchart TD
@@ -72,9 +207,22 @@ fallback later succeeds. Context chunks retain preambles/page markers, enabling 
 Legal article/chapter boundaries always take priority over similarity.
 
 Optional install: `.\.venv\Scripts\python.exe -m pip install -r requirements-semantic.txt`.
-Chonkie **1.5.2** is pinned; its tagged constructor/source was checked. Integration tests use fake
-chunkers. **Real embeddings/runtime and Arabic/French boundary quality remain unvalidated here.**
-No heavy packages or model weights were installed for this change. Enable semantic chunking
+Chonkie **1.7.0** is pinned; its published wheel's constructor/source was checked. It retains
+`embedding_model`, `threshold`, `chunk_size`, `similarity_window`, `skip_window`, `delim`, and
+`include_delim`; returned chunks retain `text`, `start_index`, `end_index`, and `token_count`.
+The adapter checks the installed distribution version before importing optional/native modules.
+On the existing Windows/Python 3.15.1 venv, binary resolution and source installation were tried:
+`chonkie-core 0.10.2` offers no compatible wheel, and its PyO3 0.27.2 build rejects Python 3.15
+(maximum supported version 3.14). No alternate venv or forced ABI compatibility override is used.
+When upstream native dependencies support this interpreter, rerun the optional requirements install.
+Until then, semantic initialization/import failure selects the existing deterministic fallback.
+Verification on Python 3.15.1: **172 tests passed, 2 optional real-package tests skipped** because
+Chonkie could not be installed. The published 1.7.0 wheel was inspected without importing it.
+Tests use fake chunkers, plus optional real-package tests with local fake embeddings and a character
+tokenizer: they verify import/API, Unicode/CRLF offsets and reconstruction without model/network
+access. Absence of the optional package skips those tests; a broken installed import fails them.
+**Real embeddings and Arabic/French boundary quality remain unvalidated here.** No model weights
+were downloaded. Enable semantic chunking
 separately and supply an embedding identifier/local model explicitly. A non-dry enabled run may
 initialize/download that chosen model; use prepared local weights for offline operation.
 
@@ -228,7 +376,7 @@ boundaries. Real annotations, model evaluation, and a cost study remain pending 
 |---|---|
 | Typed envelopes, legal supported variants, evidence audit | Implemented, offline tested |
 | Generic extraction, cache, budget, dry run, registry migrations | Implemented, fake models tested |
-| Chonkie 1.5.2 optional adapter | Tagged API verified, fake adapter tested; real embeddings unvalidated |
+| Chonkie 1.7.0 optional adapter | Published API verified; offline tests cover source invariants/fallback. Native installation blocked on this Python 3.15 environment; optional real-import tests skip while absent |
 | Paragraph fallback | Implemented default, explicitly degraded relative to semantic boundaries |
 | CLI/GUI, additive QA references, evaluation command | Implemented opt-in; legacy exports preserved |
 | Production held-out study / embedding calibration / cost study | Pending real annotations/models/operator evaluation |
@@ -397,8 +545,9 @@ training fields from [settings.py](../corpus_pipeline/settings.py).
 The default command still performs extraction plus format cleaning. All remaining stages require a
 flag or an explicitly enabled configuration setting. Stage selectors choose one optional stage per
 CLI invocation; they do not silently cascade several paid operations. The GUI exposes the same stages
-as separate tabs: Extract & clean, Synthesize, Govern, Review, and Benchmarks. Its extraction tab keeps
-the original uploads, OCR settings, progress, page reports, previews, and downloads.
+as six ordered tabs: OCR, Cleaning, Synthesis, Governance, Review and Corpus. OCR keeps uploads,
+provider settings, progress, page reports and downloads; Cleaning supplies before/after previews.
+Benchmarks are a panel inside OCR; metadata and semantic chunking are inside Synthesis.
 
 ~~~mermaid
 flowchart TD
@@ -826,7 +975,7 @@ Paths below are relative to repository root.
 | --- | --- |
 | config.py | ProviderProfile catalogue, OCR/base settings, PipelineConfig, key resolution |
 | cli.py | Backward-compatible extraction flags and explicit optional stage dispatch |
-| app.py | Gradio tabs for extraction, synthesis, governance, review, and benchmarks; shared text-generation settings; no CLI dispatch |
+| app.py | Six ordered GUI stage tabs; metadata and agents inside Synthesis, benchmarks inside OCR; shared session controls |
 | corpus_pipeline/__init__.py | Lazy public process_file wrapper, preventing config import cycles |
 | corpus_pipeline/settings.py | TrainingSettings dataclass, env_bool, load_json, settings validation |
 | corpus_pipeline/models.py | OCRResult, PageSignals, PageRoute, PageReport |
@@ -1065,15 +1214,12 @@ Copy-Item corpus_pipeline/synthesis/data/overrides.example.json data/overrides.j
 .\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp data/pytest-run
 ~~~
 
-The GUI mirrors this sequence in five tabs. **Extract & clean** runs the default command and shows
-per-file/page reports plus previews; its Concurrency accordion exposes the file, page, and OCR limits
-with `0` meaning no limit. **Synthesize** consumes cleaned TXT/MD, defaults to a dry run, and
-accepts manual overrides. **Govern** and **Review** consume JSONL produced by the previous stage; review
-is deterministic unless model review/repair is enabled. **Benchmarks** is read-only: it refreshes the
-provider/model comparison from `BENCHMARK_DIR` and displays CER/WER, reference coverage, OCR failure and
-latency summaries. The collapsible Text generation settings section supplies the provider, key, base URL,
-and `SYNTHESIS_MODEL` for the two text stages; the OCR vision model is separate. Explicit uploads take
-precedence over prefilled folder/path values, so a file is not processed twice.
+The GUI now separates this sequence into six tabs; see the GUI workflow section at the top of
+this guide for its `data/` artifact tree and separate chunk/question/answer buttons. The legacy
+CLI commands above retain their combined extraction/cleaning behavior and original defaults.
+Text provider settings in Synthesis are shared with model Review; OCR has its own vision settings.
+Explicit uploads take precedence over prefilled paths. Offline Review may produce only manual
+records because semantic review and calibrated dialect classification are intentionally not faked.
 
 The offline demonstration writes data/demo/synthetic.txt, extracts/cleans it, adds a manual
 statutory-law override, groups two synthetic articles, generates a fake QA/explanation, performs
@@ -1189,7 +1335,7 @@ pages.
 | Deterministic review offline | Implemented | Skipped checks intentionally prevent auto-acceptance |
 | Paid review caching / cross-process writer coordination | Not implemented | Use one process per output directory; paid review reruns recompute |
 | Per-document OCR/cleaning/stage benchmarking | Implemented; reference-free by default, reference metrics only when supplied | Curated references for true CER/WER; proxies are not accuracy |
-| New training stages in GUI | Implemented as one tab per stage, plus a benchmark tab | Visual/manual smoke test; automated callbacks are covered offline |
+| New training stages in GUI | Six ordered tabs; benchmarks nested inside OCR | Visual/manual smoke test; automated callbacks are covered offline |
 
 ## 9. Test evidence and change map
 
