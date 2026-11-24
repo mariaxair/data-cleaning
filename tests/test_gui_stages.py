@@ -432,6 +432,33 @@ def test_gradio_events_share_controls_and_do_not_duplicate_session_fields():
     assert not any("Evaluation minimum" in (c.label or "") for c in metadata)
 
 
+def test_quality_evaluation_gui_callbacks_use_separate_reports(tmp_path, monkeypatch):
+    from app import _run_llm_quality_evaluation, demo
+    from corpus_pipeline import benchmark
+    from corpus_pipeline.artifacts import write_jsonl
+
+    source = tmp_path / "input.jsonl"
+    write_jsonl(source, [{"text": "sample"}])
+    captured = []
+
+    def fake_evaluator(input_path, output_path, **kwargs):
+        captured.append((input_path, output_path, kwargs))
+        return {"judge_calls": 0, "judged_records": 0, "flagged_records": 0}
+
+    monkeypatch.setattr(benchmark, "evaluate_qa_quality", fake_evaluator)
+    report, status, artifacts = _run_llm_quality_evaluation(
+        "qa", str(source), str(tmp_path / "out"), "openai", "", "", "judge-model", 0)
+    assert report["judge_calls"] == 0 and "Evaluation complete" in status
+    assert captured[0][1] == tmp_path / "out/evaluation/qa-quality.json"
+    assert captured[0][2]["judge_model"] == "judge-model" and captured[0][2]["max_calls"] == 0
+    assert artifacts == [str(tmp_path / "out/evaluation/qa-quality.json")]
+
+    button_labels = {component.get("props", {}).get("value") for component in demo.config["components"]
+                     if component.get("type") == "button"}
+    assert {"Evaluate chunk quality", "Evaluate metadata quality",
+            "Evaluate question / answer quality", "Evaluate review quality"} <= button_labels
+
+
 def test_metadata_gui_cleared_embedding_does_not_reuse_env(tmp_path, monkeypatch):
     import corpus_pipeline.metadata.runner as runner
     source = _cleaned_source(tmp_path / "source.txt")

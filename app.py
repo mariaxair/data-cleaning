@@ -99,6 +99,22 @@ STAGE_SETTINGS = {
         ("metadata_promotion_documents", "int", "Documents required to promote a field"),
         ("metadata_min_confidence", "float01", "Minimum confidence for field promotion"),
     ],
+    "metadata_chunking": [
+        ("metadata_semantic_threshold", "float01", "Semantic boundary threshold"),
+        ("metadata_chunk_tokens", "int", "Maximum tokens per chunk"),
+        ("metadata_chunk_chars", "int", "Maximum characters per chunk"),
+        ("metadata_similarity_window", "int", "Semantic similarity window"),
+        ("metadata_delimiters", "delimiters", "Sentence delimiters (one per line; use \\n for newline)"),
+        ("metadata_include_delim", "choice:prev|next", "Keep delimiter with previous or next chunk"),
+    ],
+    "metadata_extraction": [
+        ("metadata_max_attempts", "int", "Metadata extraction attempts"),
+        ("metadata_max_tokens", "int", "Maximum metadata response tokens"),
+        ("metadata_match_threshold", "float01", "Field match threshold"),
+        ("metadata_match_margin", "float01", "Minimum field-match margin"),
+        ("metadata_promotion_documents", "int", "Documents required to promote a field"),
+        ("metadata_min_confidence", "float01", "Minimum confidence for field promotion"),
+    ],
     "governance": [
         ("language_mixing_threshold", "float01", "Language mixing threshold"),
         ("dialect_backend", "choice:lexicon|marbert", "Dialect detection method"),
@@ -750,6 +766,44 @@ def _run_metadata_evaluation(reference_file: Any, stage_output: str,
         return None, f"Metadata evaluation failed: {exc}"
 
 
+def _run_llm_quality_evaluation(target: str, input_path: str, stage_output: str,
+                                provider: str, key: str, base_url: str, model: str,
+                                max_calls: float | None) -> tuple[Any, str, list[str]]:
+    """Run an opt-in bounded LLM judge and keep its report outside production JSONL."""
+    try:
+        source = Path((input_path or "").strip()).expanduser()
+        if not source.is_file():
+            return None, f"Select an existing {target} JSONL file to evaluate.", []
+        if max_calls in (None, "") or int(max_calls) < 0:
+            return None, "Judge call budget must be a non-negative integer.", []
+        config = _runtime_config(provider, key, base_url, model, synthesis_model=model,
+                                 stage_output=stage_output)
+        evaluators = {
+            "chunks": "evaluate_chunk_quality",
+            "metadata": "evaluate_metadata_quality",
+            "qa": "evaluate_qa_quality",
+            "review": "evaluate_review_quality",
+        }
+        if target not in evaluators:
+            return None, "Unknown quality evaluation target.", []
+        from corpus_pipeline import benchmark
+        evaluator = getattr(benchmark, evaluators[target])
+        output_root = config.stage_output_dir
+        output = (output_root / "synthesis" / "chunking" / "evaluation.json" if target == "chunks"
+                  else output_root / "evaluation" / f"{target}-quality.json")
+        kwargs = {"config": config, "judge_model": model, "max_calls": int(max_calls)}
+        if target == "chunks":
+            result = evaluator(source, output, **kwargs)
+        else:
+            result = evaluator(source, output, **kwargs)
+        status = (f"Evaluation complete: {result.get('judged_records', result.get('judged_chunks', 0))} judged, "
+                  f"{result.get('flagged_records', result.get('flagged_chunks', 0))} flagged, "
+                  f"{result.get('judge_calls', 0)} judge calls. LLM scores are triage signals.")
+        return result, status, [str(output)]
+    except STAGE_ERRORS as exc:
+        return None, f"{target.title()} quality evaluation failed: {exc}", []
+
+
 def _load_benchmarks(
     benchmark_dir: str,
     reference_dir: str,
@@ -1027,83 +1081,108 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
                 gen_status = gr.Markdown("Set a text-capable model; the OCR vision model is not reused.")
                 generation_controls = _setting_controls("generation", title="Generation request timeout and retries")
 
-            gr.Markdown("### 1. Chunking → 2. Metadata extraction")
-            gr.Markdown(
-                "Discover evidence-backed metadata without a predefined field list. Legal syntax "
-                "preserves structure; content metadata for all document types requires explicit model enablement. "
-                "Dry run loads no models. Registry and review tables below include prior corpus runs.")
-            with gr.Row():
-                with gr.Column():
-                    meta_uploads = gr.File(label="Cleaned TXT/MD", file_count="multiple", type="filepath",
-                                           file_types=[".txt", ".md"])
-                    meta_folder = gr.Textbox(label="Or folder of cleaned files", value="data/cleaning")
-                    meta_model = gr.Textbox(label="Metadata text model (METADATA_MODEL)", value=_DEFAULTS.metadata_model)
-                    meta_semantic = gr.Checkbox(label="Use Chonkie semantic chunking", value=_DEFAULTS.metadata_semantic_enabled,
-                                                info="Requires the optional semantic dependencies and an embedding model.")
-                    meta_embedding_model = gr.Dropdown(
-                        choices=list(dict.fromkeys(["minishlab/potion-base-8M", "minishlab/potion-multilingual-128M"] +
-                                                    ([_DEFAULTS.metadata_embedding_model] if _DEFAULTS.metadata_embedding_model else []))),
-                        value=_DEFAULTS.metadata_embedding_model or None,
-                        label="Embedding model", allow_custom_value=True,
-                        interactive=_DEFAULTS.metadata_semantic_enabled,
-                        info="Choose a preset or enter any Model2Vec/Hugging Face ID or local path.")
-                    meta_semantic.change(
-                        lambda enabled: gr.update(interactive=bool(enabled)),
-                        inputs=[meta_semantic], outputs=[meta_embedding_model])
-                with gr.Column():
-                    meta_dry_run = gr.Checkbox(label="Dry run (no provider/embedding calls)", value=True)
-                    meta_live = gr.Checkbox(label="Enable metadata model calls", value=_DEFAULTS.metadata_llm_enabled)
-                    meta_max_calls = gr.Number(
-                        label="Maximum metadata model calls", value=_DEFAULTS.metadata_max_calls,
-                        minimum=1, precision=0)
-                    meta_advanced = _setting_controls("metadata")
-                    gr.Markdown("Chunks retain source order; noncontiguous merging (skip window) stays fixed at 0.")
-                    chunk_run = gr.Button("1. Chunk text (no metadata model calls)")
-                    meta_run = gr.Button("2. Extract metadata and refresh chunks", variant="primary")
-            meta_status = gr.Textbox(label="Metadata status", interactive=False)
-            meta_summary = gr.JSON(label="Metadata plan / summary")
-            meta_fields = gr.Dataframe(headers=["Field", "Type", "Scope", "Documents", "Status", "Min confidence", "ID"],
-                                        label="Discovered field registry", interactive=False, wrap=True)
-            meta_queue = gr.Dataframe(headers=["Source", "Label", "Status", "Reason"], label="Optional review queue",
-                                       interactive=False, wrap=True)
-            meta_downloads = gr.File(label="Metadata artifacts", file_count="multiple")
-            with gr.Accordion("Evaluate metadata against annotations", open=False):
-                meta_reference = gr.File(label="Annotated reference JSONL", file_count="single",
-                                         type="filepath", file_types=[".jsonl"])
-                meta_evaluation_controls = _setting_controls("evaluation", title="Evaluation thresholds")
-                meta_evaluate = gr.Button("Run metadata evaluation")
-                meta_eval_status = gr.Textbox(label="Evaluation status", interactive=False)
-                meta_eval_summary = gr.JSON(label="Evaluation results")
+            with gr.Accordion("1. Chunking", open=True):
+                gr.Markdown("Create ordered source chunks. This step makes no metadata model calls.")
+                with gr.Row():
+                    with gr.Column():
+                        meta_uploads = gr.File(label="Cleaned TXT/MD", file_count="multiple", type="filepath",
+                                               file_types=[".txt", ".md"])
+                        meta_folder = gr.Textbox(label="Or folder of cleaned files", value="data/cleaning")
+                        meta_semantic = gr.Checkbox(label="Use Chonkie semantic chunking", value=_DEFAULTS.metadata_semantic_enabled,
+                                                    info="Requires optional semantic dependencies and an embedding model.")
+                        meta_embedding_model = gr.Dropdown(
+                            choices=list(dict.fromkeys(["minishlab/potion-base-8M", "minishlab/potion-multilingual-128M"] +
+                                                        ([_DEFAULTS.metadata_embedding_model] if _DEFAULTS.metadata_embedding_model else []))),
+                            value=_DEFAULTS.metadata_embedding_model or None, label="Embedding model",
+                            allow_custom_value=True, interactive=_DEFAULTS.metadata_semantic_enabled,
+                            info="Choose a preset or enter a Model2Vec/Hugging Face ID or local path.")
+                        meta_semantic.change(lambda enabled: gr.update(interactive=bool(enabled)),
+                                             inputs=[meta_semantic], outputs=[meta_embedding_model])
+                    with gr.Column():
+                        meta_dry_run = gr.Checkbox(label="Dry run (no provider/embedding calls)", value=True)
+                        meta_chunking_controls = _setting_controls("metadata_chunking", title="Chunking parameters")
+                        gr.Markdown("Chunk order is preserved; noncontiguous merging stays disabled.")
+                        chunk_run = gr.Button("1. Create / refresh chunks", variant="primary")
+                chunk_eval_path = gr.Textbox(label="Chunks JSONL to evaluate",
+                                             value="data/synthesis/chunking/chunks.jsonl")
+                with gr.Row():
+                    chunk_judge_budget = gr.Number(label="Judge call budget (0 = deterministic only)", value=100,
+                                                   minimum=0, precision=0)
+                    chunk_evaluate = gr.Button("Evaluate chunk quality")
+                chunk_eval_status = gr.Textbox(label="Chunk evaluation status", interactive=False)
+                chunk_eval_summary = gr.JSON(label="Chunk quality report")
+                chunk_status = gr.Textbox(label="Chunking status", interactive=False)
+                chunk_summary = gr.JSON(label="Chunking plan / summary")
+                chunk_downloads = gr.File(label="Chunking artifacts", file_count="multiple")
 
-            gr.Markdown("### 3. Question agent → 4. Answer agent")
-            gr.Markdown("The agents consume saved chunks. The answer agent reuses validated question checkpoints and generates a public explanation. Optional theme discovery uses the cleaned files selected above.")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    synth_uploads = gr.File(
-                        label="Upload saved chunks JSONL", file_count="multiple", type="filepath",
-                        file_types=[".jsonl"])
-                    synth_folder = gr.Textbox(
-                        label="Or saved chunks JSONL path",
-                        value="data/synthesis/chunking/chunks.jsonl")
-                with gr.Column(scale=1):
-                    synth_max_samples = gr.Number(label="Maximum units", value=_DEFAULTS.synthesis_max_samples,
-                                                  precision=0, minimum=1)
-                    synth_dry_run = gr.Checkbox(label="Dry run (no model calls)", value=True)
-                    agent_controls = _setting_controls("agents", title="Question / answer agent settings")
-                    synth_questions_only = gr.State(False)
-                    questions_only_state = gr.State(True)
-                    question_run = gr.Button("3. Generate questions")
-                    synth_run = gr.Button("4. Generate answers (reuse saved questions)", variant="primary")
-            synth_status = gr.Textbox(label="Synthesis summary", interactive=False)
-            synth_summary = gr.JSON(label="Run details")
-            synth_downloads = gr.File(label="Synthesis artifacts", file_count="multiple")
+            with gr.Accordion("2. Metadata extraction", open=True):
+                gr.Markdown("Discover evidence-backed, open-ended metadata. Legal syntax preserves structure; content metadata comes from the enabled model.")
+                with gr.Row():
+                    meta_model = gr.Textbox(label="Metadata text model (METADATA_MODEL)", value=_DEFAULTS.metadata_model)
+                    meta_live = gr.Checkbox(label="Enable metadata model calls", value=_DEFAULTS.metadata_llm_enabled)
+                    meta_max_calls = gr.Number(label="Maximum metadata model calls", value=_DEFAULTS.metadata_max_calls,
+                                               minimum=1, precision=0)
+                meta_extraction_controls = _setting_controls("metadata_extraction", title="Metadata extraction parameters")
+                meta_advanced = [*meta_chunking_controls, *meta_extraction_controls]
+                meta_run = gr.Button("2. Extract metadata and refresh chunks", variant="primary")
+                meta_status = gr.Textbox(label="Metadata status", interactive=False)
+                meta_summary = gr.JSON(label="Metadata plan / summary")
+                meta_fields = gr.Dataframe(headers=["Field", "Type", "Scope", "Documents", "Status", "Min confidence", "ID"],
+                                            label="Discovered field registry", interactive=False, wrap=True)
+                meta_queue = gr.Dataframe(headers=["Source", "Label", "Status", "Reason"], label="Optional review queue",
+                                           interactive=False, wrap=True)
+                meta_downloads = gr.File(label="Metadata artifacts", file_count="multiple")
+                with gr.Row():
+                    meta_quality_path = gr.Textbox(label="Metadata documents JSONL",
+                                                   value="data/synthesis/metadata/documents.jsonl")
+                    meta_judge_budget = gr.Number(label="Judge call budget (0 = deterministic only)", value=100,
+                                                  minimum=0, precision=0)
+                    meta_quality_evaluate = gr.Button("Evaluate metadata quality")
+                meta_quality_status = gr.Textbox(label="Metadata quality status", interactive=False)
+                meta_quality_summary = gr.JSON(label="Metadata quality report")
+                with gr.Accordion("Compare metadata against annotations", open=False):
+                    meta_reference = gr.File(label="Annotated reference JSONL", file_count="single",
+                                             type="filepath", file_types=[".jsonl"])
+                    meta_evaluation_controls = _setting_controls("evaluation", title="Evaluation thresholds")
+                    meta_evaluate = gr.Button("Run annotated metadata evaluation")
+                    meta_eval_status = gr.Textbox(label="Evaluation status", interactive=False)
+                    meta_eval_summary = gr.JSON(label="Annotation comparison results")
+
+            with gr.Accordion("3–4. Question and answer generation", open=True):
+                gr.Markdown("The agents consume saved chunks. Answers reuse validated question checkpoints and include a public explanation.")
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        synth_uploads = gr.File(label="Upload saved chunks JSONL", file_count="multiple", type="filepath",
+                                                file_types=[".jsonl"])
+                        synth_folder = gr.Textbox(label="Or saved chunks JSONL path",
+                                                  value="data/synthesis/chunking/chunks.jsonl")
+                    with gr.Column(scale=1):
+                        synth_max_samples = gr.Number(label="Maximum units", value=_DEFAULTS.synthesis_max_samples,
+                                                      precision=0, minimum=1)
+                        synth_dry_run = gr.Checkbox(label="Dry run (no model calls)", value=True)
+                        agent_controls = _setting_controls("agents", title="Question / answer parameters")
+                        synth_questions_only = gr.State(False)
+                        questions_only_state = gr.State(True)
+                        question_run = gr.Button("3. Generate questions")
+                        synth_run = gr.Button("4. Generate answers (reuse saved questions)", variant="primary")
+                synth_status = gr.Textbox(label="Generation status", interactive=False)
+                synth_summary = gr.JSON(label="Generation run details")
+                synth_downloads = gr.File(label="Generation artifacts", file_count="multiple")
+                with gr.Row():
+                    qa_quality_path = gr.Textbox(label="Generated QA JSONL",
+                                                 value="data/synthesis/qa.jsonl")
+                    qa_judge_budget = gr.Number(label="Judge call budget (0 = deterministic only)", value=100,
+                                                minimum=0, precision=0)
+                    qa_quality_evaluate = gr.Button("Evaluate question / answer quality")
+                qa_quality_status = gr.Textbox(label="QA quality status", interactive=False)
+                qa_quality_summary = gr.JSON(label="Question / answer quality report")
             with gr.Accordion("Optional document theme discovery", open=False):
                 gr.Markdown("Discover and group themes from the cleaned files selected above; this never replaces generated QA.")
                 synth_screening_mode = gr.State("automatic")
                 synth_topics_only = gr.State(True)
                 synth_overrides_path = gr.Textbox(label="Manual overrides JSON (optional)", value=MANUAL_OVERRIDES_DEFAULT)
                 synth_topic_max_calls = gr.Number(label="Maximum theme model calls", value=_DEFAULTS.topic_max_calls, precision=0, minimum=1)
-                synth_advanced = _setting_controls("synthesis", title="Theme discovery and legacy segmentation settings")
+                synth_advanced = _setting_controls("synthesis", title="Theme discovery parameters")
                 topic_run = gr.Button("Discover document themes")
                 topic_status = gr.Textbox(label="Theme status", interactive=False)
                 topic_summary = gr.JSON(label="Theme plan / summary")
@@ -1155,6 +1234,16 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
             rev_status = gr.Textbox(label="Review summary", interactive=False)
             rev_summary = gr.JSON(label="Decision counts")
             rev_downloads = gr.File(label="Review artifacts", file_count="multiple")
+            with gr.Accordion("Independent quality evaluation", open=True):
+                gr.Markdown("A second judge assesses whether the saved review decisions and rationales fit the QA and source. This does not change review outputs.")
+                with gr.Row():
+                    review_quality_path = gr.Textbox(label="Review audit JSONL",
+                                                     value="data/review/audit.jsonl")
+                    review_judge_budget = gr.Number(label="Judge call budget (0 = no model calls)", value=100,
+                                                    minimum=0, precision=0)
+                    review_quality_evaluate = gr.Button("Evaluate review quality")
+                review_quality_status = gr.Textbox(label="Review evaluation status", interactive=False)
+                review_quality_summary = gr.JSON(label="Independent review quality report")
 
         with gr.Tab("6 - Corpus"):
             gr.Markdown("Export accepted records to `data/corpus/corpus.jsonl` (instruction / input / output). Manual and rejected records are excluded.")
@@ -1213,6 +1302,11 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
                 gen_provider, gen_api_key, gen_base_url, meta_model, meta_semantic,
                 meta_embedding_model, *meta_advanced, *generation_controls],
         outputs=[meta_summary, meta_status, meta_fields, meta_queue, meta_downloads])
+    chunk_evaluate.click(
+        lambda path, root, provider, key, base_url, model, budget:
+            _run_llm_quality_evaluation("chunks", path, root, provider, key, base_url, model, budget)[:2],
+        inputs=[chunk_eval_path, stage_output, gen_provider, gen_api_key, gen_base_url, gen_model, chunk_judge_budget],
+        outputs=[chunk_eval_summary, chunk_eval_status])
     meta_run.click(
         _run_synthesis_metadata,
         inputs=[meta_uploads, meta_folder, meta_dry_run, meta_live, meta_max_calls, stage_output,
@@ -1223,6 +1317,16 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
         lambda reference, root, *values: _run_metadata_evaluation(reference, str(_stage_output_path(root) / "synthesis"), *values),
         inputs=[meta_reference, stage_output, *meta_evaluation_controls],
         outputs=[meta_eval_summary, meta_eval_status])
+    meta_quality_evaluate.click(
+        lambda path, root, provider, key, base_url, model, budget:
+            _run_llm_quality_evaluation("metadata", path, root, provider, key, base_url, model, budget)[:2],
+        inputs=[meta_quality_path, stage_output, gen_provider, gen_api_key, gen_base_url, gen_model, meta_judge_budget],
+        outputs=[meta_quality_summary, meta_quality_status])
+    qa_quality_evaluate.click(
+        lambda path, root, provider, key, base_url, model, budget:
+            _run_llm_quality_evaluation("qa", path, root, provider, key, base_url, model, budget)[:2],
+        inputs=[qa_quality_path, stage_output, gen_provider, gen_api_key, gen_base_url, gen_model, qa_judge_budget],
+        outputs=[qa_quality_summary, qa_quality_status])
 
     gov_run.click(
         _run_governance,
@@ -1234,6 +1338,12 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
         inputs=[rev_uploads, rev_path, rev_llm, stage_output,
                 gen_provider, gen_api_key, gen_base_url, gen_model, *rev_advanced, *dialect_controls, *generation_controls],
         outputs=[rev_summary, rev_status, rev_downloads])
+    review_quality_evaluate.click(
+        lambda path, root, provider, key, base_url, model, budget:
+            _run_llm_quality_evaluation("review", path, root, provider, key, base_url, model, budget)[:2],
+        inputs=[review_quality_path, stage_output, gen_provider, gen_api_key, gen_base_url, gen_model,
+                review_judge_budget],
+        outputs=[review_quality_summary, review_quality_status])
 
     bench_outputs = [bench_table, bench_status, bench_leader, bench_comparison, bench_downloads]
     bench_refresh.click(_load_benchmarks, inputs=benchmark_controls,
@@ -1246,8 +1356,13 @@ with gr.Blocks(title="Corpus Processing Pipeline") as demo:
                       str(_stage_output_path(root) / "synthesis" / "chunking" / "chunks.jsonl"),
                       str(_stage_output_path(root) / "synthesis" / "qa.jsonl"),
                       str(_stage_output_path(root) / "governance" / "pass.jsonl"),
-                      str(_stage_output_path(root) / "review" / "accepted.jsonl")),
-        inputs=[stage_output], outputs=[clean_folder, meta_folder, synth_folder, gov_path, rev_path, corpus_path])
+                      str(_stage_output_path(root) / "review" / "accepted.jsonl"),
+                      str(_stage_output_path(root) / "synthesis" / "metadata" / "documents.jsonl"),
+                      str(_stage_output_path(root) / "review" / "audit.jsonl"),
+                      str(_stage_output_path(root) / "synthesis" / "chunking" / "chunks.jsonl"),
+                      str(_stage_output_path(root) / "synthesis" / "qa.jsonl")),
+        inputs=[stage_output], outputs=[clean_folder, meta_folder, synth_folder, gov_path, rev_path, corpus_path,
+                                        meta_quality_path, review_quality_path, chunk_eval_path, qa_quality_path])
 
 
 if __name__ == "__main__":
