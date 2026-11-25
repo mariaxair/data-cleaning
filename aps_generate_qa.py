@@ -140,7 +140,8 @@ def parse_object(text: str) -> dict:
     return value
 
 
-def select_articles(path: Path, all_articles: bool, per_language: int, seed: int) -> tuple[list[dict], dict, str]:
+def select_articles(path: Path, all_articles: bool, per_language: int | None,
+                    total: int | None, seed: int) -> tuple[list[dict], dict, str]:
     buckets = {language: [] for language in LANGUAGES}
     digest, identities = hashlib.sha256(), set()
     with io_path(path).open("rb") as handle:
@@ -160,14 +161,25 @@ def select_articles(path: Path, all_articles: bool, per_language: int, seed: int
                 raise ValueError("Input article has no text")
             buckets[row["lang"]].append(row)
     counts = {language: len(items) for language, items in buckets.items()}
+    if not all_articles and per_language is None and total is None:
+        per_language = 10
+    if not all_articles and per_language is not None and total is not None:
+        raise ValueError("Choose either per_language or total, not both")
+    targets = ({language: len(buckets[language]) for language in LANGUAGES} if all_articles else
+               {language: per_language for language in LANGUAGES} if per_language is not None else
+               {language: total // len(LANGUAGES) + (index < total % len(LANGUAGES))
+                for index, language in enumerate(LANGUAGES)})
     selected = []
     for language, records in buckets.items():
         records.sort(key=lambda r: r["uuid"])
+        target = targets[language]
+        if target == 0:
+            continue
         if all_articles:
             selected.extend(records)
             continue
-        if len(records) < per_language:
-            raise ValueError(f"Only {len(records)} {language} articles available; requested {per_language}")
+        if len(records) < target:
+            raise ValueError(f"Only {len(records)} {language} articles available; requested {target}")
         groups = defaultdict(list)
         for record in records:
             groups[str(record.get("category") or "unknown")].append(record)
@@ -177,11 +189,11 @@ def select_articles(path: Path, all_articles: bool, per_language: int, seed: int
         for category in categories:
             rng.shuffle(groups[category])
         chosen = []
-        while len(chosen) < per_language:
+        while len(chosen) < target:
             for category in categories:
                 if groups[category]:
                     chosen.append(groups[category].pop())
-                    if len(chosen) == per_language:
+                    if len(chosen) == target:
                         break
         selected.extend(chosen)
     if not selected:
@@ -485,7 +497,9 @@ def main(argv=None) -> int:
     parser.add_argument("--run", action="store_true", help="Make paid API calls; default only prepares local prompt previews")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--all", action="store_true")
-    mode.add_argument("--per-language", type=positive_int, help="Default: 10 articles per language")
+    mode.add_argument("--per-language", type=positive_int, help="Sample N articles per language (default: 10)")
+    mode.add_argument("--total", type=positive_int,
+                      help="Sample exactly N articles total; distributes them across ar, fr and en")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rpm", type=positive_float, default=10, help="Shared requests/minute for both models and all retries; not a verified provider quota")
     parser.add_argument("--concurrency", type=positive_int, default=2)
@@ -517,7 +531,8 @@ def main(argv=None) -> int:
     try:
         templates = {phase: Template(io_path(args.prompts.resolve() / f"aps_{phase}s.txt").read_text(encoding="utf-8"))
                      for phase in models}
-        articles, available, source_hash = select_articles(source, args.all, args.per_language or 10, args.seed)
+        articles, available, source_hash = select_articles(source, args.all, args.per_language,
+                                                           args.total, args.seed)
         summary_path = io_path(source.with_name("summary.json"))
         source_summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
         excerpts = set(source_summary.get("public_excerpt_uuids", []))
@@ -544,6 +559,7 @@ def main(argv=None) -> int:
             "selected_by_language": dict(Counter(a["lang"] for a in articles)), "available_by_language": available,
             "models": {phase: settings.identity() for phase, settings in models.items()},
             "rpm_shared": args.rpm, "concurrency": args.concurrency, "max_attempts_per_phase": args.max_attempts,
+            "selection_mode": "all" if args.all else "total" if args.total is not None else "per_language",
             "calls_without_retries_at_most": 2 * len(articles), "question_count_policy": "Model decides; no numeric question limit",
             "token_policy": "Output-token budgets are technical limits. Truncated outputs fail explicitly and remain resumable.",
             "review": "Deferred; generated pairs are candidates, not reviewed or approved training examples"}

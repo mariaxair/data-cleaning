@@ -274,3 +274,22 @@ def test_no_useful_questions_skips_answer_call(tmp_path, monkeypatch, article, t
     result = qa.process_article(article, templates, set(), api, tmp_path, "run", 1)
     assert result["questions"] == [] and result["pairs"] == []
     assert [request["model"] for request in requests] == ["question-model"]
+
+
+def test_total_selection_is_exact_and_balanced_across_languages(tmp_path):
+    source = tmp_path / "articles.jsonl"
+    rows = []
+    for language in qa.LANGUAGES:
+        for index in range(4):
+            rows.append({"uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{language}-{index}")),
+                         "text": f"Text {language} {index}", "title": f"Title {index}",
+                         "lang": language, "source_url": "https://example.invalid", "article_id": str(index),
+                         "published": "2026-01-01", "category": f"Category {index}"})
+    source.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    selected, available, _ = qa.select_articles(source, False, None, 4, 42)
+    assert len(selected) == 4
+    assert {language: sum(row["lang"] == language for row in selected) for language in qa.LANGUAGES} == {
+        "ar": 2, "fr": 1, "en": 1}
+    assert available == {language: 4 for language in qa.LANGUAGES}
+    selected_again, _, _ = qa.select_articles(source, False, None, 4, 42)
+    assert [row["uuid"] for row in selected_again] == [row["uuid"] for row in selected]

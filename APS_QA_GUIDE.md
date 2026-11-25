@@ -18,7 +18,7 @@ The answer model receives the original article, its metadata and every generated
 question. It answers the list in one call. Responses must cover every question ID.
 Unanswerable questions are saved separately. No review model or scoring runs here.
 
-## Prepare the 30-article preview
+## Prepare a small preview
 
 From the project directory:
 
@@ -37,6 +37,16 @@ preview retains `{{QUESTIONS_FROM_QUESTION_MODEL}}` until real questions exist.
 Inspect `plan.json` for selection counts, role settings and request limits.
 No credentials are placed in these files. Previewing requires no API key.
 
+To prepare exactly four articles total, use:
+
+```powershell
+python aps_generate_qa.py --total 4 --output data/aps-qa-4-preview --question-model gpt-6.1-sol --answer-model gpt-6-astra
+```
+
+The four are distributed deterministically as **2 Arabic, 1 French and 1 English**,
+then one category is selected for each language. The plan records the exact UUIDs.
+This selection happens locally and makes no model calls.
+
 ## Launch the paid pilot yourself
 
 The default gateway is `https://www.heiyucode.com/v1`. The script reads the
@@ -46,7 +56,7 @@ also be supplied via environment variables. Never put the key in a CLI argument.
 After inspecting the prompts and verifying the two model names:
 
 ```powershell
-python aps_generate_qa.py --question-model gpt-6.1-sol --answer-model gpt-6-astra --run
+python aps_generate_qa.py --total 4 --output data/aps-qa-4 --question-model gpt-6.1-sol --answer-model gpt-6-astra --run
 ```
 
 Normally this makes two requests per article: questions, then answers. Articles
